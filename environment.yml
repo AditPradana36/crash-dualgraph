@@ -1,0 +1,18 @@
+name: crash-dualgraph
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - geopandas
+  - shapely
+  - osmnx
+  - pyyaml
+  - tqdm
+  - scipy
+  - matplotlib
+  - pip
+  - pip:
+      - transformers
+      - torch
+      - torch-geometric
+      - xgboost

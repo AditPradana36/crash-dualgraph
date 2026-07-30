@@ -1,0 +1,13 @@
+# pip fallback — used where conda isn't required
+pandas
+geopandas
+shapely
+osmnx
+pyyaml
+tqdm
+scipy
+matplotlib
+transformers
+torch
+torch-geometric
+xgboost
