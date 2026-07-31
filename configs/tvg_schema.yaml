@@ -1,0 +1,16 @@
+isovist_radius_m: 50
+crash_history_threshold_m: 100
+n_rays: 360
+bbox_padding_m: 100
+building_shape_metrics:
+- area
+- perimeter
+- circular_compactness
+- elongation
+- orientation
+- shape_index
+isovist_shape_metrics:
+- area
+- compactness
+- occlusivity
+peer_incident_attributes: []

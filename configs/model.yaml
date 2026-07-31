@@ -1,0 +1,19 @@
+hidden_dim: 64
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.35
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+- G
+ablation_scope:
+- B
+- C
+- D
+- E
+- F

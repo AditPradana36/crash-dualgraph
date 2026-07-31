@@ -1,0 +1,37 @@
+mapillary_checkpoint: facebook/mask2former-swin-large-mapillary-vistas-panoptic
+node_types:
+- ego
+- signage
+- light_pole
+- road_marking
+- building
+- vegetation
+tier1_thing_classes:
+- Traffic Light
+- Traffic Sign (Front)
+- Traffic Sign (Back)
+- Traffic Sign Frame
+- Street Light
+- Pole
+- Utility Pole
+stuff_classes_for_island_labeling:
+- Building
+- Vegetation
+- Crosswalk - Plain
+- Lane Marking - General
+enclosure_crop_fraction_from_top: 0.4
+enclosure_classes:
+- building
+- wall
+- fence
+- vegetation
+- traffic_light
+- street_light
+- pole
+- utility_pole
+- traffic_sign_front
+- traffic_sign_back
+- traffic_sign_frame
+near_cutoff_d: 0.175
+mask_confidence_threshold: 0.5
+mask_min_area_fraction: 0.0008

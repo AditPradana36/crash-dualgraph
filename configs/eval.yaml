@@ -1,0 +1,60 @@
+k_folds: 5
+repeats: 3
+batch_size: 32
+epoch_cap: 150
+patience: 20
+metrics_formal_test:
+- pr_auc
+- auroc
+metrics_descriptive_only:
+- f1
+- precision
+- recall
+significance_test_primary: wilcoxon_signed_rank
+significance_test_secondary: nadeau_bengio_corrected_t
+correction_method: holm_bonferroni
+correction_scope: per_metric
+interpretability_methods:
+- attention_weights
+- gnnexplainer
+pairs:
+- - A
+  - B
+- - C
+  - A
+- - C
+  - B
+- - C
+  - D
+- - C
+  - E
+- - C
+  - F
+- - D
+  - E
+- - D
+  - F
+- - E
+  - F
+- - G
+  - A
+- - G
+  - B
+- - G
+  - C
+- - G
+  - D
+- - G
+  - E
+- - G
+  - F
+- - B
+  - B+
+- - C
+  - C+
+- - D
+  - D+
+- - E
+  - E+
+- - F
+  - F+
