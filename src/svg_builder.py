@@ -48,6 +48,8 @@ CLASS_IDX = {
     "signage": {"Traffic Sign Frame": 0, "Traffic Sign (Back)": 1, "Traffic Sign (Front)": 2},
     "light_pole": {"Traffic Light": 0, "Street Light": 1, "Pole": 2, "Utility Pole": 3},
     "road_marking": {"Crosswalk - Plain": 0, "Lane Marking - General": 1},
+    "building": {"Building": 0},
+    "vegetation": {"Vegetation": 0},
 }
 
 
