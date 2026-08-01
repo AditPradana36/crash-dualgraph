@@ -37,7 +37,7 @@ ISLAND_CLASSES = {"Crosswalk - Plain", "Lane Marking - General", "Building", "Ve
 # panoptic post-processing — no further splitting needed.
 THING_CLASSES = {
     "Traffic Sign Frame", "Traffic Sign (Back)", "Traffic Sign (Front)",
-    "Traffic Light", "Street Light", "Pole", "Utility Pole", "banner", "billboard"
+    "Traffic Light", "Street Light", "Pole", "Utility Pole", "Banner", "Billboard"
 }
 
 OBJECT_NODE_TYPES = ["signage", "light_pole", "road_marking", "building", "vegetation"]
@@ -47,7 +47,7 @@ POLE_FAMILY_TYPES = ["signage", "light_pole"]
 # node is looked up against these; the actual embedding happens in the
 # model (06), not here.
 CLASS_IDX = {
-    "signage": {"Traffic Sign Frame": 0, "Traffic Sign (Back)": 1, "Traffic Sign (Front)": 2, "banner": 3, "billboard": 4},
+    "signage": {"Traffic Sign Frame": 0, "Traffic Sign (Back)": 1, "Traffic Sign (Front)": 2, "Banner": 3, "Billboard": 4},
     "light_pole": {"Traffic Light": 0, "Street Light": 1, "Pole": 2, "Utility Pole": 3},
     "road_marking": {"Crosswalk - Plain": 0, "Lane Marking - General": 1},
     "building": {"Building": 0},
