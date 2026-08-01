@@ -14,6 +14,8 @@ tier1_thing_classes:
 - Street Light
 - Pole
 - Utility Pole
+- Banner
+- Billboard
 stuff_classes_for_island_labeling:
 - Building
 - Vegetation
@@ -35,6 +37,8 @@ enclosure_classes:
 - Traffic Sign (Front)
 - Traffic Sign (Back)
 - Traffic Sign Frame
+- Banner
+- Billboard
 # Provisional — revisit once real segmented images are visually inspected.
 near_cutoff_d: 0.175
 mask_confidence_threshold: 0.5
