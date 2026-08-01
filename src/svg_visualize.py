@@ -46,7 +46,7 @@ EGO_OUTLINE = _contrasting_outline((0, 0, 0))  # white
 
 EDGE_STYLE = {
     "sees": dict(linestyle="-", alpha=1, linewidth=3.5, color="white"),       # was 1.0
-    "mounted_with": dict(linestyle="--", alpha=2, linewidth=2.5, color="yellow"),  # was 1.3
+    "mounted_with": dict(linestyle="--", alpha=1, linewidth=2.5, color="yellow"),  # was 1.3
     "near": dict(linestyle=":", alpha=1, linewidth=2.5, color="cyan"),       # was 0.8
 }
 
