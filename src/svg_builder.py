@@ -53,16 +53,18 @@ CLASS_IDX = {
 }
 
 
-def extract_objects(seg_map, segments_info, min_area_fraction):
-    """Returns dict: node_type -> list of dicts with
-    class_name, cx_px, cy_px, area_px, bbox (xmin, ymin, xmax, ymax).
-    """
+def extract_objects(seg_map, segments_info, min_area_fraction, min_area_fraction_by_type=None):
+    """min_area_fraction_by_type: optional dict node_type -> override fraction.
+    Falls back to min_area_fraction if a node_type isn't in the dict."""
     total_px = seg_map.size
-    min_area_px = min_area_fraction * total_px
+    min_area_fraction_by_type = min_area_fraction_by_type or {}
+    min_area_px_default = min_area_fraction * total_px
     objects = {nt: [] for nt in OBJECT_NODE_TYPES}
 
     def _record(node_type, class_name, mask):
         area = int(mask.sum())
+        threshold_frac = min_area_fraction_by_type.get(node_type, min_area_fraction)
+        min_area_px = threshold_frac * total_px
         if area < min_area_px:
             return
         ys, xs = np.nonzero(mask)

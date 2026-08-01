@@ -38,7 +38,10 @@ enclosure_classes:
 # Provisional — revisit once real segmented images are visually inspected.
 near_cutoff_d: 0.175
 mask_confidence_threshold: 0.5
-mask_min_area_fraction: 0.0008
+mask_min_area_fraction: 0.0008          # default, used for signage/light_pole/road_marking
+mask_min_area_fraction_by_type:
+  building: 0.1     # tune these based on visual inspection
+  vegetation: 0.1
 # NEW parameter, surfaced while building 03 — was never explicitly set before.
 # Recommended starting value: deliberately much smaller than near_cutoff_d,
 # since this is meant to indicate "physically co-located on the same support"
