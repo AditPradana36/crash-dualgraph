@@ -28,7 +28,8 @@ INCIDENT_NEGATIVE_COLOR = "blue"
 PEER_COLOR = "red"  # peers are always positive-labeled — never a separate color
 
 INTERSECTION_COLOR = "black"
-ROAD_EDGE_COLOR = "#666666"       # connects: real OSM road edges
+BACKGROUND_ROAD_COLOR = "#cccccc"  # full underlying road network, context only
+ROAD_EDGE_COLOR = "#666666"       # connects: real OSM road edges (included subgraph)
 ANCHOR_EDGE_COLOR = "#999999"     # anchors: incident <-> building/intersection
 ADJACENT_EDGE_COLOR = "orange"    # adjacent: building <-> building clique
 FRONTS_EDGE_COLOR = "green"       # fronts: building -> nearest intersection
@@ -97,6 +98,23 @@ def render_tvg_overlay(origin_xy, label, polygon, included_building_ids,
         if idx in included_set:
             c = geom.centroid
             building_centroid[idx] = (c.x, c.y)
+
+    # ── Full underlying road network (context only) — every edge in G whose
+    #    endpoints fall in this point's plot window, regardless of whether it
+    #    made it into the HeteroData subgraph. Drawn first / lowest z-order so
+    #    the "included" connects edges still stand out on top of it. Filtering
+    #    by node coordinate bbox (not a spatial index) is cheap: G.nodes is a
+    #    plain dict, and this window is tiny relative to the whole city graph.
+    if G is not None:
+        xmin, xmax = ox_ - half, ox_ + half
+        ymin, ymax = oy_ - half, oy_ + half
+        for a, b, ed in G.edges(data=True):
+            ax_, ay_ = G.nodes[a]["x"], G.nodes[a]["y"]
+            bx_, by_ = G.nodes[b]["x"], G.nodes[b]["y"]
+            if (xmin <= ax_ <= xmax or xmin <= bx_ <= xmax) and \
+               (ymin <= ay_ <= ymax or ymin <= by_ <= ymax):
+                ax.plot([ax_, bx_], [ay_, by_], color=BACKGROUND_ROAD_COLOR,
+                        linewidth=1.0, alpha=0.9, zorder=0.5)
 
     # ── Isovist ──────────────────────────────────────────────────────────
     if polygon is not None and not polygon.is_empty:
