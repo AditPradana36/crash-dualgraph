@@ -20,18 +20,28 @@ stuff_classes_for_island_labeling:
 - Crosswalk - Plain
 - Lane Marking - General
 enclosure_crop_fraction_from_top: 0.4
+# FIXED: must be exact Mapillary class name strings (matching segments_info's
+# class_name field exactly) — the original lowercase/snake_case version
+# silently matched nothing and would have zeroed out Enclosure for every image.
 enclosure_classes:
-- building
-- wall
-- fence
-- vegetation
-- traffic_light
-- street_light
-- pole
-- utility_pole
-- traffic_sign_front
-- traffic_sign_back
-- traffic_sign_frame
+- Building
+- Wall
+- Fence
+- Vegetation
+- Traffic Light
+- Street Light
+- Pole
+- Utility Pole
+- Traffic Sign (Front)
+- Traffic Sign (Back)
+- Traffic Sign Frame
+# Provisional — revisit once real segmented images are visually inspected.
 near_cutoff_d: 0.175
 mask_confidence_threshold: 0.5
 mask_min_area_fraction: 0.0008
+# NEW parameter, surfaced while building 03 — was never explicitly set before.
+# Recommended starting value: deliberately much smaller than near_cutoff_d,
+# since this is meant to indicate "physically co-located on the same support"
+# (e.g. a sign and light on the same pole), not general proximity.
+# PROVISIONAL — please confirm or override, same as the three above.
+mounted_with_distance_threshold: 0.04
