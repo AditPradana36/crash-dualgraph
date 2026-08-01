@@ -45,9 +45,9 @@ EGO_MARKER_SIZE = 1000
 EGO_OUTLINE = _contrasting_outline((0, 0, 0))  # white
 
 EDGE_STYLE = {
-    "sees": dict(linestyle="-", alpha=0.75, linewidth=2.5, color="white"),       # was 1.0
-    "mounted_with": dict(linestyle="--", alpha=2, linewidth=2.6, color="yellow"),  # was 1.3
-    "near": dict(linestyle=":", alpha=0.5, linewidth=2, color="cyan"),       # was 0.8
+    "sees": dict(linestyle="-", alpha=1, linewidth=3.5, color="white"),       # was 1.0
+    "mounted_with": dict(linestyle="--", alpha=2, linewidth=2.5, color="yellow"),  # was 1.3
+    "near": dict(linestyle=":", alpha=1, linewidth=2.5, color="cyan"),       # was 0.8
 }
 
 OBJECT_NODE_TYPES = ["signage", "light_pole", "road_marking", "building", "vegetation"]
