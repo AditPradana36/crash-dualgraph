@@ -1,13 +1,249 @@
 """
 Builds one TVG (Top View Graph) HeteroData object per point, using
-osm_fetch.py's cached layer and isovist.py's ray-casting.
+osm_fetch.py's cached global layer and isovist.py's ray-casting.
 
-Functions to implement:
-- project_incident(point, street_graph) -> (u, v, fraction_along)
-- included_buildings(hit_building_idx, buildings_gdf) -> GeoDataFrame
-- included_intersections(isovist_polygon, street_nodes, u, v) -> GeoDataFrame
-- build_anchors_edges(...) / build_adjacent_edges(...) / build_connects_edges(...)
-- build_fronts_edges(...) / build_on_segment_edges(...)
-- build_crash_history_edges(...)   # ablation only, same-fold, positive peers only
-- assemble_tvg(...) -> HeteroData
+Node types: incident, building, intersection, peer_incident.
 """
+import itertools
+import math
+
+import numpy as np
+import torch
+from torch_geometric.data import HeteroData
+from shapely.geometry import Point
+
+import geo_utils
+import isovist as iso
+
+
+def _safe_float(value, default=0.0):
+    """Parses an OSM tag value (often a messy string) to float. Returns
+    (value, is_missing_flag) — never raises, never silently fabricates
+    a plausible-looking number beyond the flagged default."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return default, 1.0
+    try:
+        return float(str(value).split(";")[0].replace("m", "").strip()), 0.0
+    except (ValueError, TypeError):
+        return default, 1.0
+
+
+def process_incident(
+    incident_row, reconciled_df, buildings_gdf, building_type_vocab, highway_vocab, G,
+    betweenness, orientation_entropy, tree, boundaries, utm_crs,
+    isovist_radius_m, n_rays, crash_history_threshold_m,
+):
+    """Returns (data: HeteroData, meta: dict) for one incident point.
+    meta carries plotting-relevant info reused by tvg_visualize.py so
+    nothing needs recomputing for the QC image.
+    """
+    lat, lon = incident_row["input_lat"], incident_row["input_lon"]
+    point_utm = geo_utils.project_point(lat, lon, utm_crs)
+    origin_xy = (point_utm.x, point_utm.y)
+
+    # ── Road projection ──────────────────────────────────────────────
+    u, v, key, edge_geom, edge_data = geo_utils.nearest_road_edge(G, origin_xy)
+    _, fraction_along = geo_utils.project_onto_edge(origin_xy, edge_geom)
+
+    # ── Isovist ──────────────────────────────────────────────────────
+    polygon, hit_building_idx, ray_hit_flags = iso.compute_isovist(
+        origin_xy, tree, boundaries, isovist_radius_m, n_rays
+    )
+    isovist_area = iso.isovist_area(polygon)
+    isovist_compactness = iso.isovist_compactness(polygon)
+    isovist_occlusivity = iso.isovist_occlusivity(ray_hit_flags)
+
+    # ── Included buildings: exactly what bounded the isovist ─────────
+    included_building_ids = sorted(hit_building_idx)
+
+    # ── Included intersections: inside isovist, plus u/v always exempted ──
+    included_intersections = set()
+    for node_id, data_n in G.nodes(data=True):
+        pt = Point(data_n["x"], data_n["y"])
+        if polygon.covers(pt):
+            included_intersections.add(node_id)
+    included_intersections.add(u)
+    included_intersections.add(v)
+    included_intersections = sorted(included_intersections)
+    node_local_idx = {nid: i for i, nid in enumerate(included_intersections)}
+
+    # ── Peer incidents: same-fold, POSITIVE-labeled only, within threshold ──
+    fold_col = [c for c in reconciled_df.columns if c.startswith("fold_rep")][0]
+    same_fold = reconciled_df[
+        (reconciled_df[fold_col] == incident_row[fold_col])
+        & (reconciled_df["point_id"] != incident_row["point_id"])
+        & (reconciled_df["label"] == 1)  # HARD RULE: peers are never negative points
+    ]
+    if len(same_fold):
+        dists = np.hypot(same_fold["_utm_x"] - origin_xy[0], same_fold["_utm_y"] - origin_xy[1])
+        peers = same_fold[dists.values <= crash_history_threshold_m]
+    else:
+        peers = same_fold
+
+    # ── Assemble HeteroData ──────────────────────────────────────────
+    data = HeteroData()
+
+    data["incident"].x = torch.tensor(
+        [[fraction_along, isovist_area, isovist_compactness, isovist_occlusivity]],
+        dtype=torch.float,
+    )
+    # NEW: the incident's own road type — a direct node feature, not left to
+    # arrive solely via on_segment's edge attribute. Not an ablation: negatives
+    # were deliberately sampled to match positives' highway-type distribution,
+    # so this doesn't carry the circularity risk that put crash_history behind
+    # an ablation gate.
+    incident_hw = edge_data.get("highway", "unclassified")
+    if isinstance(incident_hw, list):
+        incident_hw = incident_hw[0]
+    incident_hw_idx = highway_vocab.get(incident_hw, highway_vocab["unclassified"])
+    data["incident"].highway_type_idx = torch.tensor([incident_hw_idx], dtype=torch.long)
+
+    if included_building_ids:
+        rows = buildings_gdf.loc[included_building_ids]
+        feats, type_idx, height_vals, height_flags, levels_vals, levels_flags = [], [], [], [], [], []
+        for _, r in rows.iterrows():
+            feats.append([r["area"], r["perimeter"], r["circular_compactness"],
+                          r["elongation"], r["orientation"], r["shape_index"]])
+            type_idx.append(int(r["type_idx"]))
+            hv, hf = _safe_float(r.get("height"))
+            lv, lf = _safe_float(r.get("building:levels"))
+            height_vals.append(hv); height_flags.append(hf)
+            levels_vals.append(lv); levels_flags.append(lf)
+
+        data["building"].x = torch.tensor(feats, dtype=torch.float)
+        data["building"].type_idx = torch.tensor(type_idx, dtype=torch.long)
+        data["building"].height = torch.tensor(height_vals, dtype=torch.float).unsqueeze(1)
+        data["building"].height_missing = torch.tensor(height_flags, dtype=torch.float).unsqueeze(1)
+        data["building"].levels = torch.tensor(levels_vals, dtype=torch.float).unsqueeze(1)
+        data["building"].levels_missing = torch.tensor(levels_flags, dtype=torch.float).unsqueeze(1)
+    else:
+        data["building"].x = torch.zeros((0, 6), dtype=torch.float)
+        data["building"].type_idx = torch.zeros((0,), dtype=torch.long)
+        for attr in ["height", "height_missing", "levels", "levels_missing"]:
+            data["building"][attr] = torch.zeros((0, 1), dtype=torch.float)
+
+    inter_feats = [[betweenness.get(nid, 0.0), orientation_entropy.get(nid, 0.0)]
+                   for nid in included_intersections]
+    data["intersection"].x = torch.tensor(inter_feats, dtype=torch.float) if inter_feats else torch.zeros((0, 2), dtype=torch.float)
+
+    n_peers = len(peers)
+    data["peer_incident"].x = torch.ones((n_peers, 1), dtype=torch.float)  # constant placeholder — no real attributes
+
+    # ── Edges ─────────────────────────────────────────────────────────
+    diag_placeholder = 1.0  # distances here are real meters, no diagonal normalization needed (metric CRS)
+
+    def _dist(ax, ay, bx, by):
+        return math.hypot(ax - bx, ay - by)
+
+    # anchors: incident <-> every included building & intersection, bidirectional
+    if included_building_ids:
+        b_dists = [_dist(origin_xy[0], origin_xy[1], buildings_gdf.loc[bid].geometry.centroid.x,
+                          buildings_gdf.loc[bid].geometry.centroid.y) for bid in included_building_ids]
+        fwd = torch.tensor([[0] * len(included_building_ids), list(range(len(included_building_ids)))], dtype=torch.long)
+        attr = torch.tensor(b_dists, dtype=torch.float).unsqueeze(1)
+        data["incident", "anchors", "building"].edge_index = fwd
+        data["incident", "anchors", "building"].edge_attr = attr
+        data["building", "anchors", "incident"].edge_index = fwd.flip(0)
+        data["building", "anchors", "incident"].edge_attr = attr
+
+    if included_intersections:
+        i_dists = [_dist(origin_xy[0], origin_xy[1], G.nodes[nid]["x"], G.nodes[nid]["y"])
+                   for nid in included_intersections]
+        fwd = torch.tensor([[0] * len(included_intersections), list(range(len(included_intersections)))], dtype=torch.long)
+        attr = torch.tensor(i_dists, dtype=torch.float).unsqueeze(1)
+        data["incident", "anchors", "intersection"].edge_index = fwd
+        data["incident", "anchors", "intersection"].edge_attr = attr
+        data["intersection", "anchors", "incident"].edge_index = fwd.flip(0)
+        data["intersection", "anchors", "incident"].edge_attr = attr
+
+    # adjacent: FULL CLIQUE among included buildings (per locked redefinition —
+    # "all buildings that touched the isovist" IS the adjacency criterion)
+    n_b = len(included_building_ids)
+    if n_b > 1:
+        pairs = list(itertools.combinations(range(n_b), 2))
+        src = [p[0] for p in pairs] + [p[1] for p in pairs]
+        dst = [p[1] for p in pairs] + [p[0] for p in pairs]
+        data["building", "adjacent", "building"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["building", "adjacent", "building"].edge_attr = torch.ones((len(src), 1), dtype=torch.float)
+    else:
+        data["building", "adjacent", "building"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["building", "adjacent", "building"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
+
+    # connects: REAL OSM edges among included intersections only
+    src, dst, attrs = [], [], []
+    for i, a in enumerate(included_intersections):
+        for j, b in enumerate(included_intersections):
+            if i == j:
+                continue
+            if G.has_edge(a, b):
+                for key_ in G[a][b]:
+                    ed = G[a][b][key_]
+                    hw = ed.get("highway", "unclassified")
+                    if isinstance(hw, list):
+                        hw = hw[0]
+                    hw_idx = highway_vocab.get(hw, highway_vocab["unclassified"])
+                    maxspeed_val, maxspeed_missing = _safe_float(ed.get("maxspeed"))
+                    oneway = 1.0 if ed.get("oneway") else 0.0
+                    src.append(i); dst.append(j)
+                    attrs.append([float(hw_idx), maxspeed_val, maxspeed_missing, oneway])
+    if src:
+        data["intersection", "connects", "intersection"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["intersection", "connects", "intersection"].edge_attr = torch.tensor(attrs, dtype=torch.float)
+    else:
+        data["intersection", "connects", "intersection"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["intersection", "connects", "intersection"].edge_attr = torch.zeros((0, 4), dtype=torch.float)
+
+    # fronts: each building -> its nearest INCLUDED intersection
+    if included_building_ids and included_intersections:
+        src, dst, attrs = [], [], []
+        for bi, bid in enumerate(included_building_ids):
+            bx, by = buildings_gdf.loc[bid].geometry.centroid.x, buildings_gdf.loc[bid].geometry.centroid.y
+            dists = [_dist(bx, by, G.nodes[nid]["x"], G.nodes[nid]["y"]) for nid in included_intersections]
+            nearest_j = int(np.argmin(dists))
+            src.append(bi); dst.append(nearest_j); attrs.append(dists[nearest_j])
+        data["building", "fronts", "intersection"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["building", "fronts", "intersection"].edge_attr = torch.tensor(attrs, dtype=torch.float).unsqueeze(1)
+    else:
+        data["building", "fronts", "intersection"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["building", "fronts", "intersection"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
+
+    # on_segment: incident <-> u, incident <-> v, bidirectional, road attrs copied
+    u_local, v_local = node_local_idx[u], node_local_idx[v]
+    dist_u = _dist(origin_xy[0], origin_xy[1], G.nodes[u]["x"], G.nodes[u]["y"])
+    dist_v = _dist(origin_xy[0], origin_xy[1], G.nodes[v]["x"], G.nodes[v]["y"])
+    hw = edge_data.get("highway", "unclassified")
+    if isinstance(hw, list):
+        hw = hw[0]
+    hw_idx = highway_vocab.get(hw, highway_vocab["unclassified"])
+    maxspeed_val, maxspeed_missing = _safe_float(edge_data.get("maxspeed"))
+    oneway = 1.0 if edge_data.get("oneway") else 0.0
+
+    seg_fwd = torch.tensor([[0, 0], [u_local, v_local]], dtype=torch.long)
+    seg_attr = torch.tensor([[dist_u, float(hw_idx), maxspeed_val, maxspeed_missing, oneway],
+                              [dist_v, float(hw_idx), maxspeed_val, maxspeed_missing, oneway]], dtype=torch.float)
+    data["incident", "on_segment", "intersection"].edge_index = seg_fwd
+    data["incident", "on_segment", "intersection"].edge_attr = seg_attr
+    data["intersection", "on_segment", "incident"].edge_index = seg_fwd.flip(0)
+    data["intersection", "on_segment", "incident"].edge_attr = seg_attr
+
+    # crash_history (ablation): incident -> each peer, distance-weighted
+    if n_peers:
+        peer_dists = np.hypot(peers["_utm_x"].values - origin_xy[0], peers["_utm_y"].values - origin_xy[1])
+        data["incident", "crash_history", "peer_incident"].edge_index = torch.tensor(
+            [[0] * n_peers, list(range(n_peers))], dtype=torch.long
+        )
+        data["incident", "crash_history", "peer_incident"].edge_attr = torch.tensor(
+            peer_dists, dtype=torch.float
+        ).unsqueeze(1)
+    else:
+        data["incident", "crash_history", "peer_incident"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["incident", "crash_history", "peer_incident"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
+
+    meta = {
+        "origin_xy": origin_xy, "polygon": polygon,
+        "included_building_ids": included_building_ids,
+        "included_intersections": included_intersections,
+        "peer_point_ids": peers["point_id"].tolist() if n_peers else [],
+        "u": u, "v": v,
+    }
+    return data, meta

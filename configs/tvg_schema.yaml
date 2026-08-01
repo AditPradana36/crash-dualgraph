@@ -2,6 +2,12 @@ isovist_radius_m: 50
 crash_history_threshold_m: 100
 n_rays: 360
 bbox_padding_m: 100
+network_type: drive
+# adjacent (building-building) has NO distance/buffer parameter — its
+# trigger is "both buildings touched the isovist" (the same criterion
+# that determines Building node inclusion), i.e. a full clique among
+# whichever buildings the isovist already included. No separate cutoff
+# needed here, unlike SVG's near/mounted_with.
 building_shape_metrics:
 - area
 - perimeter
@@ -13,4 +19,12 @@ isovist_shape_metrics:
 - area
 - compactness
 - occlusivity
+# Confirmed: no attributes at all — existence + crash_history's distance
+# edge feature is the only information a peer carries.
 peer_incident_attributes: []
+# highway_type_idx is now also a direct Incident node feature (not just
+# riding along on on_segment's edge attribute) — categorical, using the
+# same GLOBAL highway_vocab built once in osm_fetch.py. Not an ablation:
+# negatives were sampled to match positives' highway-type distribution,
+# so this doesn't carry crash_history's circularity risk.
+incident_highway_feature: true
