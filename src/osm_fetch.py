@@ -19,6 +19,7 @@ import geopandas as gpd
 import osmnx as ox
 import networkx as nx
 from shapely.strtree import STRtree
+from shapely.geometry import box
 
 
 def fetch_study_area_layers(boundary_geojson, bbox_padding_m, network_type="drive"):
@@ -38,12 +39,8 @@ def fetch_study_area_layers(boundary_geojson, bbox_padding_m, network_type="driv
     minx -= bbox_padding_m; miny -= bbox_padding_m
     maxx += bbox_padding_m; maxy += bbox_padding_m
 
-    padded_bbox_utm = gpd.GeoDataFrame(
-        geometry=[gpd.points_from_xy([minx, maxx], [miny, maxy]).unary_union.envelope],
-        crs=utm_crs,
-    )
-    padded_bbox_wgs84 = padded_bbox_utm.to_crs(epsg=4326)
-    bbox_polygon_wgs84 = padded_bbox_wgs84.geometry.iloc[0]
+    bbox_polygon_utm = box(minx, miny, maxx, maxy)
+    bbox_polygon_wgs84 = gpd.GeoSeries([bbox_polygon_utm], crs=utm_crs).to_crs(epsg=4326).iloc[0]
 
     buildings = ox.features_from_polygon(bbox_polygon_wgs84, tags={"building": True})
     buildings = buildings[buildings.geometry.type.isin(["Polygon", "MultiPolygon"])].reset_index(drop=True)
