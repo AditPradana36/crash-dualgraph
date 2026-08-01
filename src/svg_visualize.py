@@ -41,13 +41,13 @@ def _contrasting_outline(rgb_0_1):
 
 EGO_COLOR = "black"
 EGO_MARKER = "*"
-EGO_MARKER_SIZE = 650
+EGO_MARKER_SIZE = 1000
 EGO_OUTLINE = _contrasting_outline((0, 0, 0))  # white
 
 EDGE_STYLE = {
-    "sees": dict(linestyle="-", alpha=0.75, linewidth=2.0, color="white"),       # was 1.0
-    "mounted_with": dict(linestyle="--", alpha=0.9, linewidth=2.6, color="yellow"),  # was 1.3
-    "near": dict(linestyle=":", alpha=0.35, linewidth=1.6, color="cyan"),       # was 0.8
+    "sees": dict(linestyle="-", alpha=0.75, linewidth=2.5, color="white"),       # was 1.0
+    "mounted_with": dict(linestyle="--", alpha=2, linewidth=2.6, color="yellow"),  # was 1.3
+    "near": dict(linestyle=":", alpha=0.5, linewidth=2, color="cyan"),       # was 0.8
 }
 
 OBJECT_NODE_TYPES = ["signage", "light_pole", "road_marking", "building", "vegetation"]
@@ -114,7 +114,7 @@ def render_svg_overlay(image, seg_map, segments_info, objects, data, w, h, seg_a
         for o in objects[node_type]:
             color = NODE_COLOR.get(o["class_name"], (1, 0, 0))
             outline = _contrasting_outline(color)
-            ax.scatter([o["cx_px"]], [o["cy_px"]], marker="o", s=160,
+            ax.scatter([o["cx_px"]], [o["cy_px"]], marker="o", s=400,
                        color=color, zorder=4, edgecolors=outline, linewidths=1.5)
 
     return fig
