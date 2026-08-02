@@ -213,6 +213,7 @@ def assemble_svg(objects, w, h, svf, enclosure, entropy, near_cutoff_d, mounted_
         if len(objs) == 0:
             data[node_type].x = torch.zeros((0, 2), dtype=torch.float)
             data[node_type].class_idx = torch.zeros((0,), dtype=torch.long)
+            data[node_type].area_norm = torch.zeros((0, 1), dtype=torch.float)
             continue
         feats = [[o["cx_px"] / w, o["cy_px"] / h] for o in objs]  # per-axis-normalized position (feature only)
         idxs = [CLASS_IDX[node_type][o["class_name"]] for o in objs]
