@@ -14,6 +14,22 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
+
+def _to_jsonable(obj):
+    """Recursively convert numpy/torch scalar types to native Python types.
+
+    evaluate.py's metrics (and comparisons like `> best_val_prauc`) often
+    come back as numpy.float64 / numpy.bool_ rather than plain float/bool.
+    json.dumps doesn't know how to serialize those -- this walks dicts/
+    lists and casts anything with a numpy-style .item() method."""
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    if hasattr(obj, "item"):  # numpy scalar types (float64, bool_, int64, ...)
+        return obj.item()
+    return obj
+
 import graph_datasets as ds
 import models
 import evaluate as ev
@@ -117,7 +133,7 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     test_metrics = ev.compute_metrics(test_true, test_prob)
 
     if history_path is not None:
-        Path(history_path).write_text(json.dumps(history, indent=1))
+        Path(history_path).write_text(json.dumps(_to_jsonable(history), indent=1))
 
     return test_metrics, best_state
 
@@ -164,6 +180,6 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
             )
             results.append({"fold_col": fold_col, "fold_id": int(fold_id), "n_train": n_train,
                              "n_test": len(test_df), **test_metrics})
-            results_path.write_text(json.dumps(results, indent=1))
+            results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
 
     return results
