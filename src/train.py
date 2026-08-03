@@ -152,6 +152,15 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
     results = json.loads(results_path.read_text()) if results_path.exists() else []
     done_keys = {(r["fold_col"], r["fold_id"]) for r in results}
 
+    # Only the single best fold's weights are kept on disk per (scenario,
+    # depth, ablation) tag -- "best" = highest test pr_auc. Re-evaluated
+    # every time a fold finishes so the saved model always reflects the
+    # best fold seen so far, even across resumed/interrupted runs.
+    best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
+    best_so_far = (json.loads(best_model_meta_path.read_text())
+                   if best_model_meta_path.exists() else None)
+
     index_df = dataset.index_df
     for fold_col in fold_cols:
         for fold_id in sorted(index_df[fold_col].unique()):
@@ -173,11 +182,20 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
                 print(f"  -- {fold_col} fold {fold_id} (n_train={n_train}, n_test={len(test_df)}) --")
 
             fold_history_path = history_dir / f"{fold_col}_fold{fold_id}.json"
-            test_metrics, _ = train_one_fold(
+            test_metrics, best_state = train_one_fold(
                 scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
                 svg_kwargs, tvg_kwargs, config, device,
                 verbose=verbose, history_path=fold_history_path,
             )
+
+            if best_so_far is None or test_metrics["pr_auc"] > best_so_far["pr_auc"]:
+                torch.save(best_state, best_model_path)
+                best_so_far = {"fold_col": fold_col, "fold_id": int(fold_id),
+                                "pr_auc": test_metrics["pr_auc"], "auroc": test_metrics.get("auroc")}
+                best_model_meta_path.write_text(json.dumps(_to_jsonable(best_so_far), indent=1))
+                if verbose:
+                    print(f"    -> new best model for {tag} (test pr_auc={test_metrics['pr_auc']:.4f}), saved.")
+
             results.append({"fold_col": fold_col, "fold_id": int(fold_id), "n_train": n_train,
                              "n_test": len(test_df), **test_metrics})
             results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
