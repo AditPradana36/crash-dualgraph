@@ -10,6 +10,7 @@ metrics_descriptive_only:
 - f1
 - precision
 - recall
+- accuracy
 significance_test_primary: wilcoxon_signed_rank
 significance_test_secondary: nadeau_bengio_corrected_t
 correction_method: holm_bonferroni
