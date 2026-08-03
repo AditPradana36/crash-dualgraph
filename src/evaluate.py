@@ -7,8 +7,7 @@ low p, manual Holm-Bonferroni arithmetic) before being written here.
 """
 import numpy as np
 from scipy import stats
-from sklearn.metrics import average_precision_score, roc_auc_score, f1_score, precision_score, recall_score
-
+from sklearn.metrics import average_precision_score, roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
 
 def compute_metrics(y_true, y_prob, threshold=0.5):
     y_true = np.asarray(y_true)
@@ -17,6 +16,7 @@ def compute_metrics(y_true, y_prob, threshold=0.5):
     return {
         "pr_auc": average_precision_score(y_true, y_prob),
         "auroc": roc_auc_score(y_true, y_prob),
+        "accuracy": accuracy_score(y_true, y_pred),   # NEW
         "f1": f1_score(y_true, y_pred, zero_division=0),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
