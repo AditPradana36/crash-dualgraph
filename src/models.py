@@ -62,19 +62,33 @@ def embed_edge_attr_with_categorical(edge_attr, cat_col, embedder):
 def _pool_and_anchor(x_dict, batch_dict, anchor_type):
     """Readout: concat[global_mean_pool(all nodes), anchor node embedding].
     batch_dict: optional dict of per-node-type batch-index tensors (from
-    PyG's HeteroData batching in 07); None = treat as a single graph."""
+    PyG's HeteroData batching in 07); None = treat as a single graph.
+
+    FIX: global_mean_pool only emits a row for graph-indices that actually
+    appear in `batch`. When some graphs in the batch have zero nodes of a
+    given type (e.g. a point with no signage detected), that graph's row
+    goes missing entirely instead of coming back as zeros -- silently
+    shrinking that node type's pooled tensor and breaking the later
+    torch.stack across node types (mismatched batch dim). We force every
+    node type to align to the full batch size, taken from anchor_type
+    (assumed always present, exactly one per graph)."""
+    num_graphs = batch_dict[anchor_type].max().item() + 1 if batch_dict is not None else 1
+
     pooled_parts = []
     for nt, x in x_dict.items():
         if x.shape[0] == 0:
+            # No nodes of this type anywhere in the batch -> contribute zeros
+            # for every graph rather than dropping this node type entirely.
+            pooled_parts.append(torch.zeros(num_graphs, x.shape[1], device=x.device))
             continue
         batch = batch_dict[nt] if batch_dict is not None else torch.zeros(x.shape[0], dtype=torch.long)
-        pooled_parts.append(global_mean_pool(x, batch))
-    pooled = torch.stack(pooled_parts, dim=0).sum(dim=0) if pooled_parts else torch.zeros(1, list(x_dict.values())[0].shape[1])
+        pooled_parts.append(global_mean_pool(x, batch, size=num_graphs))
+    pooled = torch.stack(pooled_parts, dim=0).sum(dim=0) if pooled_parts else torch.zeros(num_graphs, list(x_dict.values())[0].shape[1])
 
     anchor = x_dict[anchor_type]
     if batch_dict is not None:
         anchor_batch = batch_dict[anchor_type]
-        anchor_pooled = global_mean_pool(anchor, anchor_batch)  # anchor is always exactly 1 per graph
+        anchor_pooled = global_mean_pool(anchor, anchor_batch, size=num_graphs)  # anchor is always exactly 1 per graph
     else:
         anchor_pooled = anchor.mean(dim=0, keepdim=True)
 
