@@ -14,7 +14,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
-import graph_datasets as ds
+import datasets as ds
 import models
 import evaluate as ev
 
@@ -42,8 +42,12 @@ def _run_epoch_eval(model, scenario, loader, device, svg_nt, tvg_nt):
 
 
 def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, test_items,
-                    svg_kwargs, tvg_kwargs, config, device):
-    """*_items: list of (svg_data, tvg_data, label, point_id) for that split."""
+                    svg_kwargs, tvg_kwargs, config, device, verbose=True, history_path=None):
+    """*_items: list of (svg_data, tvg_data, label, point_id) for that split.
+
+    verbose: print train_loss / val_pr_auc / val_auroc each epoch.
+    history_path: if given, write the full per-epoch history to this JSON
+    path after training (for later plotting -- see plot_fold_history)."""
     stats = ds.fit_normalization([i[0] for i in train_items], [i[1] for i in train_items])
 
     def _norm(items):
@@ -68,9 +72,11 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     tvg_nt = models.TVG_NODE_TYPES if use_ablation else [nt for nt in models.TVG_NODE_TYPES if nt != "peer_incident"]
 
     best_val_prauc, best_state, no_improve = -1.0, None, 0
+    history = []
 
     for epoch in range(config["epoch_cap"]):
         model.train()
+        epoch_loss, n_batches = 0.0, 0
         for svg_batch, tvg_batch, labels, _ in train_loader:
             svg_batch, tvg_batch, labels = svg_batch.to(device), tvg_batch.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -78,31 +84,54 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+        train_loss = epoch_loss / max(n_batches, 1)
 
         val_true, val_prob = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt)
         val_metrics = ev.compute_metrics(val_true, val_prob)
         scheduler.step(val_metrics["pr_auc"])
 
-        if val_metrics["pr_auc"] > best_val_prauc:
+        improved = val_metrics["pr_auc"] > best_val_prauc
+        history.append({"epoch": epoch, "train_loss": train_loss,
+                         "val_pr_auc": val_metrics["pr_auc"], "val_auroc": val_metrics.get("auroc"),
+                         "lr": optimizer.param_groups[0]["lr"], "improved": improved})
+
+        if verbose:
+            marker = " *" if improved else ""
+            print(f"    epoch {epoch:3d} | train_loss {train_loss:.4f} | "
+                  f"val_pr_auc {val_metrics['pr_auc']:.4f} | val_auroc {val_metrics.get('auroc', float('nan')):.4f} | "
+                  f"no_improve {no_improve}/{config['patience']}{marker}")
+
+        if improved:
             best_val_prauc, best_state, no_improve = val_metrics["pr_auc"], copy.deepcopy(model.state_dict()), 0
         else:
             no_improve += 1
             if no_improve >= config["patience"]:
+                if verbose:
+                    print(f"    early stop at epoch {epoch} (best val_pr_auc={best_val_prauc:.4f})")
                 break
 
     model.load_state_dict(best_state)
     test_true, test_prob = _run_epoch_eval(model, scenario, test_loader, device, svg_nt, tvg_nt)
-    return ev.compute_metrics(test_true, test_prob), best_state
+    test_metrics = ev.compute_metrics(test_true, test_prob)
+
+    if history_path is not None:
+        Path(history_path).write_text(json.dumps(history, indent=1))
+
+    return test_metrics, best_state
 
 
 def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config, svg_kwargs, tvg_kwargs,
-                  device, checkpoint_dir):
+                  device, checkpoint_dir, verbose=True):
     """Repeated spatial k-fold: iterates every (fold_col, fold_id) combination,
     checkpointed so completed fold-runs are skipped on re-run."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{scenario}_{head_depth}{'_ablation' if use_ablation else ''}"
     results_path = checkpoint_dir / f"{tag}_results.json"
+    history_dir = checkpoint_dir / f"{tag}_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
 
     results = json.loads(results_path.read_text()) if results_path.exists() else []
     done_keys = {(r["fold_col"], r["fold_id"]) for r in results}
@@ -124,9 +153,14 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
                 return [dataset[i] for i in df.index]
 
             n_train = len(train_df)
+            if verbose:
+                print(f"  -- {fold_col} fold {fold_id} (n_train={n_train}, n_test={len(test_df)}) --")
+
+            fold_history_path = history_dir / f"{fold_col}_fold{fold_id}.json"
             test_metrics, _ = train_one_fold(
                 scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
                 svg_kwargs, tvg_kwargs, config, device,
+                verbose=verbose, history_path=fold_history_path,
             )
             results.append({"fold_col": fold_col, "fold_id": int(fold_id), "n_train": n_train,
                              "n_test": len(test_df), **test_metrics})
