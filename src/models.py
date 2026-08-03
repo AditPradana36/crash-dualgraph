@@ -52,7 +52,7 @@ def embed_edge_attr_with_categorical(edge_attr, cat_col, embedder):
     if edge_attr.shape[0] == 0:
         emb_dim = embedder.embed.embedding_dim
         remaining_dim = edge_attr.shape[1] - 1
-        return torch.zeros((0, emb_dim + remaining_dim))
+        return torch.zeros((0, emb_dim + remaining_dim), device=edge_attr.device)
     cat_idx = edge_attr[:, cat_col].long()
     continuous = torch.cat([edge_attr[:, :cat_col], edge_attr[:, cat_col + 1:]], dim=1)
     embedded = embedder(cat_idx)
@@ -71,7 +71,14 @@ def _pool_and_anchor(x_dict, batch_dict, anchor_type):
     shrinking that node type's pooled tensor and breaking the later
     torch.stack across node types (mismatched batch dim). We force every
     node type to align to the full batch size, taken from anchor_type
-    (assumed always present, exactly one per graph)."""
+    (assumed always present, exactly one per graph).
+
+    Every torch.zeros/torch.arange fallback below is pinned to the anchor's
+    device explicitly -- torch.zeros(...) with no device= always defaults
+    to CPU, which crashes the moment it's concatenated with a CUDA tensor
+    (e.g. inside a downstream nn.Linear) once training actually runs on GPU."""
+    anchor = x_dict[anchor_type]
+    device = anchor.device
     num_graphs = batch_dict[anchor_type].max().item() + 1 if batch_dict is not None else 1
 
     pooled_parts = []
@@ -81,11 +88,11 @@ def _pool_and_anchor(x_dict, batch_dict, anchor_type):
             # for every graph rather than dropping this node type entirely.
             pooled_parts.append(torch.zeros(num_graphs, x.shape[1], device=x.device))
             continue
-        batch = batch_dict[nt] if batch_dict is not None else torch.zeros(x.shape[0], dtype=torch.long)
+        batch = batch_dict[nt] if batch_dict is not None else torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         pooled_parts.append(global_mean_pool(x, batch, size=num_graphs))
-    pooled = torch.stack(pooled_parts, dim=0).sum(dim=0) if pooled_parts else torch.zeros(num_graphs, list(x_dict.values())[0].shape[1])
+    pooled = (torch.stack(pooled_parts, dim=0).sum(dim=0) if pooled_parts
+              else torch.zeros(num_graphs, list(x_dict.values())[0].shape[1], device=device))
 
-    anchor = x_dict[anchor_type]
     if batch_dict is not None:
         anchor_batch = batch_dict[anchor_type]
         anchor_pooled = global_mean_pool(anchor, anchor_batch, size=num_graphs)  # anchor is always exactly 1 per graph
@@ -157,7 +164,7 @@ class SVGEncoder(nn.Module):
                 cls_emb = embedder(data[nt].class_idx)
                 x_dict[nt] = torch.cat([pos_area, cls_emb], dim=1)
             else:
-                x_dict[nt] = torch.zeros((0, pos_area.shape[1] + embedder.embed.embedding_dim))
+                x_dict[nt] = torch.zeros((0, pos_area.shape[1] + embedder.embed.embedding_dim), device=pos_area.device)
 
         for nt in ["building", "vegetation"]:
             x_dict[nt] = torch.cat([data[nt].x, data[nt].area_norm], dim=1)
@@ -271,7 +278,7 @@ class TVGEncoder(nn.Module):
             building_x = torch.cat([data["building"].x, type_emb, height_feat, levels_feat], dim=1)
         else:
             dim = 6 + self.building_type_embed.embed.embedding_dim + self.height_module.proj.out_features * 2
-            building_x = torch.zeros((0, dim))
+            building_x = torch.zeros((0, dim), device=incident_x.device)
 
         x_dict = {
             "incident": incident_x,
