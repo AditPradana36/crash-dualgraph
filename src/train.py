@@ -14,7 +14,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
-import graph.datasets as ds
+import graph_datasets as ds
 import models
 import evaluate as ev
 
