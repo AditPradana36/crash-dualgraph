@@ -2,7 +2,7 @@ k_folds: 5
 repeats: 3
 batch_size: 32
 epoch_cap: 150
-patience: 20
+patience: 40
 metrics_formal_test:
 - pr_auc
 - auroc
