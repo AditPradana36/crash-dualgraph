@@ -1,6 +1,6 @@
 k_folds: 5
 repeats: 3
-batch_size: 32
+batch_size: 128
 epoch_cap: 150
 patience: 40
 metrics_formal_test:

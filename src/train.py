@@ -80,7 +80,7 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
 
     model = models.build_model(scenario, fusion_dim=64, head_depth=head_depth, use_ablation=use_ablation,
                                 svg_kwargs=svg_kwargs, tvg_kwargs=tvg_kwargs).to(device)
-    optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = AdamW(model.parameters(), lr=5e-3, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(optimizer, mode="max", patience=5, factor=0.5)
     criterion = torch.nn.BCEWithLogitsLoss()
 
