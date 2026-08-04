@@ -127,6 +127,7 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     optimizer = AdamW(model.parameters(), lr=config.get("lr", 5e-3), weight_decay=config.get("weight_decay", 1e-4))
     scheduler = ReduceLROnPlateau(optimizer, mode="max", patience=config.get("lr_patience", 5), factor=0.5)
     criterion = torch.nn.BCEWithLogitsLoss()
+    warmup_epochs = config.get("warmup_epochs", 0)
 
     # bf16 autocast engages the A100's Tensor Cores for matmuls/convs during
     # the forward pass, which is the main thing that actually raises GPU
@@ -167,28 +168,31 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
         val_true, val_prob = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
                                               is_cuda=is_cuda, use_amp=use_amp)
         val_metrics = ev.compute_metrics(val_true, val_prob)
-        scheduler.step(val_metrics["pr_auc"])
+        if epoch >= warmup_epochs:
+            scheduler.step(val_metrics["pr_auc"])
 
         improved = val_metrics["pr_auc"] > best_val_prauc
         history.append({"epoch": epoch, "train_loss": train_loss,
                          "val_pr_auc": val_metrics["pr_auc"], "val_auroc": val_metrics.get("auroc"),
                          "lr": optimizer.param_groups[0]["lr"], "improved": improved})
 
-        if verbose:
-            marker = " *" if improved else ""
-            print(f"    epoch {epoch:3d} | train_loss {train_loss:.4f} | "
-                  f"val_pr_auc {val_metrics['pr_auc']:.4f} | val_auroc {val_metrics.get('auroc', float('nan')):.4f} | "
-                  f"no_improve {no_improve}/{config['patience']}{marker}")
-
         if improved:
-            best_val_prauc, best_state, no_improve = val_metrics["pr_auc"], copy.deepcopy(model.state_dict()), 0
-            best_train_loss, best_val_loss = train_loss, val_metrics.get("bce_loss")
+            best_val_prauc = val_metrics["pr_auc"]
+            best_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+            best_train_loss = train_loss
+            best_val_loss = val_metrics.get("bce_loss")
         else:
-            no_improve += 1
-            if no_improve >= config["patience"]:
-                if verbose:
-                    print(f"    early stop at epoch {epoch} (best val_pr_auc={best_val_prauc:.4f})")
-                break
+            if epoch >= warmup_epochs:
+                no_improve += 1
+
+                if no_improve >= config["patience"]:
+                    if verbose:
+                        print(
+                            f"    early stop at epoch {epoch} "
+                            f"(best val_pr_auc={best_val_prauc:.4f})"
+                        )
+                    break
 
     model.load_state_dict(best_state)
     test_true, test_prob = _run_epoch_eval(model, scenario, test_loader, device, svg_nt, tvg_nt,
