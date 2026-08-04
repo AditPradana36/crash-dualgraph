@@ -7,19 +7,36 @@ low p, manual Holm-Bonferroni arithmetic) before being written here.
 """
 import numpy as np
 from scipy import stats
-from sklearn.metrics import average_precision_score, roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
+from sklearn.metrics import (
+    average_precision_score, roc_auc_score, f1_score, precision_score,
+    recall_score, accuracy_score, confusion_matrix, log_loss,
+)
 
 def compute_metrics(y_true, y_prob, threshold=0.5):
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
     y_pred = (y_prob >= threshold).astype(int)
+
+    # confusion_matrix needs labels= pinned in case a fold's y_true/y_pred
+    # happens to contain only one class (small/imbalanced folds) -- without
+    # it sklearn would return a 1x1 matrix instead of 2x2.
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+    # log_loss needs both classes present in y_true, and y_prob clipped away
+    # from exact 0/1 to avoid -inf.
+    y_prob_clipped = np.clip(y_prob, 1e-7, 1 - 1e-7)
+    bce_loss = (log_loss(y_true, y_prob_clipped, labels=[0, 1])
+                if len(np.unique(y_true)) > 1 else float("nan"))
+
     return {
         "pr_auc": average_precision_score(y_true, y_prob),
         "auroc": roc_auc_score(y_true, y_prob),
-        "accuracy": accuracy_score(y_true, y_pred),   # NEW
+        "accuracy": accuracy_score(y_true, y_pred),
         "f1": f1_score(y_true, y_pred, zero_division=0),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
+        "bce_loss": bce_loss,
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
     }
 
 
