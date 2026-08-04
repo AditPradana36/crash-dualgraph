@@ -88,7 +88,7 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     # exactly the "0% GPU util forever" symptom. Default to 0 (safe,
     # single-process loading) and let config opt into >0 explicitly once
     # verified to work in this environment.
-    num_workers = config.get("num_workers", 0)
+    num_workers = config.get("num_workers", 2)
 
     def _loader(items, shuffle):
         return DataLoader(
