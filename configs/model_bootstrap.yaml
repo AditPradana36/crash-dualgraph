@@ -1,0 +1,30 @@
+# Model config for the bootstrap branch (07b_train_eval_bootstrap.ipynb).
+# Separate from model.yaml (used by the formal 07 k-fold pipeline) so
+# changes here don't affect that run.
+#
+# hidden_dim/dropout doubled vs model.yaml's hidden_dim=64/dropout=0.35 --
+# per the diagnostic in 07's history logs: train_loss fell steadily while
+# val_pr_auc plateaued from ~epoch 2-3 onward, consistent with overfitting
+# at the smaller capacity. Dropout raised alongside hidden_dim so added
+# capacity doesn't just overfit faster; weight_decay (see eval_bootstrap.yaml)
+# raised for the same reason.
+hidden_dim: 128
+fusion_dim: 128
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.45
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+- G
+ablation_scope:
+- B
+- C
+- D
+- E
+- F

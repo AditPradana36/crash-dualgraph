@@ -1,14 +1,23 @@
 """
-Training loop + repeated spatial k-fold orchestration. Encoders trained
-independently, end-to-end, per scenario, per fold — never shared/frozen
-across scenarios or folds. Checkpointed per (scenario, head_depth,
-ablation, fold, repeat) combination so a Colab disconnect resumes rather
-than restarting.
+Training loop, plus TWO separate orchestration schemes on top of it:
+
+  run_scenario()           -- repeated spatial k-fold (the FORMAL pipeline,
+                               used by 07_train_eval.ipynb; feeds evaluate.py's
+                               pre-registered Wilcoxon/Nadeau-Bengio tests).
+  run_scenario_bootstrap() -- bootstrap resampling (used by
+                               07b_train_eval_bootstrap.ipynb; a separate,
+                               parallel exploration, not a replacement).
+
+Encoders trained independently, end-to-end, per scenario, per fold/repeat --
+never shared/frozen across scenarios or folds/repeats. Checkpointed per
+(scenario, head_depth, ablation, fold-or-repeat) combination so a Colab
+disconnect resumes rather than restarting.
 """
 import copy
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -88,7 +97,7 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     # exactly the "0% GPU util forever" symptom. Default to 0 (safe,
     # single-process loading) and let config opt into >0 explicitly once
     # verified to work in this environment.
-    num_workers = config.get("num_workers", 2)
+    num_workers = config.get("num_workers", 0)
 
     def _loader(items, shuffle):
         return DataLoader(
@@ -101,10 +110,10 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
 
     train_loader, val_loader, test_loader = _loader(train_items, True), _loader(val_items, False), _loader(test_items, False)
 
-    model = models.build_model(scenario, fusion_dim=64, head_depth=head_depth, use_ablation=use_ablation,
-                                svg_kwargs=svg_kwargs, tvg_kwargs=tvg_kwargs).to(device)
-    optimizer = AdamW(model.parameters(), lr=5e-3, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", patience=5, factor=0.5)
+    model = models.build_model(scenario, fusion_dim=config.get("fusion_dim", 128), head_depth=head_depth,
+                                use_ablation=use_ablation, svg_kwargs=svg_kwargs, tvg_kwargs=tvg_kwargs).to(device)
+    optimizer = AdamW(model.parameters(), lr=config.get("lr", 5e-3), weight_decay=config.get("weight_decay", 1e-4))
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", patience=config.get("lr_patience", 5), factor=0.5)
     criterion = torch.nn.BCEWithLogitsLoss()
 
     # bf16 autocast engages the A100's Tensor Cores for matmuls/convs during
@@ -192,7 +201,17 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
 def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config, svg_kwargs, tvg_kwargs,
                   device, checkpoint_dir, verbose=True):
     """Repeated spatial k-fold: iterates every (fold_col, fold_id) combination,
-    checkpointed so completed fold-runs are skipped on re-run."""
+    checkpointed so completed fold-runs are skipped on re-run.
+
+    This is the FORMAL pipeline's orchestration function, used by
+    07_train_eval.ipynb. Its fold-level scores are what feed evaluate.py's
+    Wilcoxon / Nadeau-Bengio significance tests, which are specifically
+    designed for paired, correlated scores from repeated k-fold CV --
+    don't swap this out for run_scenario_bootstrap's output without also
+    reconsidering whether those tests still apply (see run_scenario_bootstrap
+    docstring for why bootstrap-repeat scores aren't the same statistical
+    object as k-fold scores).
+    """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{scenario}_{head_depth}{'_ablation' if use_ablation else ''}"
@@ -260,5 +279,117 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
             results.append({"fold_col": fold_col, "fold_id": int(fold_id), "n_train": n_train,
                              "n_test": len(test_df), **test_metrics})
             results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
+
+    return results
+
+
+def run_scenario_bootstrap(scenario, head_depth, use_ablation, dataset, n_repeats, config, svg_kwargs, tvg_kwargs,
+                            device, checkpoint_dir, verbose=True, id_col="point_id", seed=42):
+    """Bootstrap-repeats orchestration -- a SEPARATE, parallel scheme from
+    run_scenario's spatial k-fold above, used by 07b_train_eval_bootstrap.ipynb.
+    Not a replacement for run_scenario / the formal k-fold pipeline: see
+    that function's docstring for why the two produce statistically
+    different objects (k-fold partition vs. resampled-with-replacement),
+    which matters for evaluate.py's Wilcoxon/Nadeau-Bengio tests.
+
+    Each repeat:
+      1. Sample len(index_df) rows WITH REPLACEMENT from the full dataset
+         (classic bootstrap resample).
+      2. Dedup by id_col before splitting into train/val/test. Sampling
+         with replacement means the same point can be drawn more than
+         once within a repeat -- if a duplicate lands in both train and
+         test, that's the same graph the model already saw during
+         training showing up again in the "held-out" test set, which
+         would silently inflate test performance. Dedup keeps train/val/
+         test disjoint by point identity even though the resample itself
+         has repeats.
+      3. train/val/test split via the SAME percentages every repeat
+         (config["val_frac"], config["test_frac"]), each repeat's split
+         randomized independently via repeat_seed = seed + repeat_idx so
+         results are reproducible but not identical across repeats.
+
+    Checkpointed per repeat, same resume-on-reconnect behavior as the old
+    fold-based version: repeats already present in results.json are
+    skipped on re-run.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"{scenario}_{head_depth}{'_ablation' if use_ablation else ''}"
+    results_path = checkpoint_dir / f"{tag}_results.json"
+    history_dir = checkpoint_dir / f"{tag}_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    results = json.loads(results_path.read_text()) if results_path.exists() else []
+    done_repeats = {r["repeat"] for r in results}
+
+    # Same val-based (not test-based) selection rule as the fold version --
+    # see run_scenario's docstring/comments for the reasoning. Only the
+    # single best repeat's weights are kept on disk.
+    best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
+    best_so_far = (json.loads(best_model_meta_path.read_text())
+                   if best_model_meta_path.exists() else None)
+
+    index_df = dataset.index_df
+    n_total = len(index_df)
+    val_frac = config.get("val_frac", 0.15)
+    test_frac = config.get("test_frac", 0.15)
+
+    for repeat in range(n_repeats):
+        if repeat in done_repeats:
+            continue
+
+        repeat_seed = seed + repeat
+        rng = np.random.default_rng(repeat_seed)
+
+        # classic bootstrap: sample n_total rows WITH replacement
+        boot_idx = rng.integers(0, n_total, size=n_total)
+        boot_df = index_df.iloc[boot_idx]
+        # dedup by id_col -- see docstring. keep='first' just needs to be
+        # deterministic; which duplicate survives doesn't matter since
+        # they're the same underlying point.
+        boot_df = boot_df.drop_duplicates(subset=id_col, keep="first")
+
+        # shuffle then split by percentage -- .sample(frac=1) with the
+        # repeat-specific seed gives an independent random ordering per
+        # repeat, distinct from the resampling RNG above.
+        shuffled = boot_df.sample(frac=1.0, random_state=repeat_seed)
+        n = len(shuffled)
+        n_val = int(round(n * val_frac))
+        n_test = int(round(n * test_frac))
+
+        val_df = shuffled.iloc[:n_val]
+        test_df = shuffled.iloc[n_val:n_val + n_test]
+        train_df = shuffled.iloc[n_val + n_test:]
+
+        def _items(df):
+            return [dataset[i] for i in df.index]
+
+        if verbose:
+            print(f"  -- repeat {repeat} (bootstrap n={n} after dedup from {n_total}, "
+                  f"n_train={len(train_df)}, n_val={len(val_df)}, n_test={len(test_df)}) --")
+
+        repeat_history_path = history_dir / f"repeat{repeat}.json"
+        test_metrics, best_state = train_one_fold(
+            scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
+            svg_kwargs, tvg_kwargs, config, device,
+            verbose=verbose, history_path=repeat_history_path,
+        )
+
+        if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
+            torch.save(best_state, best_model_path)
+            best_so_far = {"repeat": repeat,
+                            "val_pr_auc": test_metrics["val_pr_auc"],
+                            "test_pr_auc": test_metrics["pr_auc"],
+                            "test_auroc": test_metrics.get("auroc")}
+            best_model_meta_path.write_text(json.dumps(_to_jsonable(best_so_far), indent=1))
+            if verbose:
+                print(f"    -> new best model for {tag} "
+                      f"(val pr_auc={test_metrics['val_pr_auc']:.4f}, "
+                      f"test pr_auc={test_metrics['pr_auc']:.4f}), saved.")
+
+        results.append({"repeat": repeat, "n_train": len(train_df), "n_val": len(val_df),
+                         "n_test": len(test_df), **test_metrics})
+        results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
 
     return results

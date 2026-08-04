@@ -1,0 +1,37 @@
+# Eval config for the bootstrap branch (07b_train_eval_bootstrap.ipynb).
+# Separate from eval.yaml (used by the formal 07 k-fold pipeline).
+#
+# No k_folds/repeats here -- replaced by n_repeats, since this scheme
+# resamples the full dataset with replacement each repeat rather than
+# partitioning it into folds. No significance_test_*/correction_*/pairs
+# section either: 07's Wilcoxon + Nadeau-Bengio tests are specifically
+# built for paired, correlated k-fold scores (see evaluate.py and
+# train.py's run_scenario docstring) and aren't valid as-is for
+# bootstrap-repeat scores, which lack that partition structure. This
+# branch reports descriptive aggregates (mean +/- std across repeats)
+# only -- see 07b's intro cell.
+n_repeats: 20
+val_frac: 0.15
+test_frac: 0.15
+batch_size: 128
+epoch_cap: 150
+patience: 40
+lr_patience: 5
+lr: 0.005
+# raised from model.yaml/eval.yaml's implicit 1e-4 default (train.py),
+# alongside the larger hidden_dim/fusion_dim in model_bootstrap.yaml --
+# see that file's comment for why.
+weight_decay: 0.0003
+num_workers: 0
+use_amp: true
+metrics_descriptive_only:
+- pr_auc
+- auroc
+- f1
+- precision
+- recall
+- accuracy
+- bce_loss
+interpretability_methods:
+- attention_weights
+- gnnexplainer
