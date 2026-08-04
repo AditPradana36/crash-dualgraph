@@ -145,6 +145,11 @@ def process_incident(
         data["incident", "anchors", "building"].edge_attr = attr
         data["building", "anchors", "incident"].edge_index = fwd.flip(0)
         data["building", "anchors", "incident"].edge_attr = attr
+    else:
+        data["incident", "anchors", "building"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["incident", "anchors", "building"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
+        data["building", "anchors", "incident"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["building", "anchors", "incident"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
 
     if included_intersections:
         i_dists = [_dist(origin_xy[0], origin_xy[1], G.nodes[nid]["x"], G.nodes[nid]["y"])
@@ -155,6 +160,11 @@ def process_incident(
         data["incident", "anchors", "intersection"].edge_attr = attr
         data["intersection", "anchors", "incident"].edge_index = fwd.flip(0)
         data["intersection", "anchors", "incident"].edge_attr = attr
+    else:
+        data["incident", "anchors", "intersection"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["incident", "anchors", "intersection"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
+        data["intersection", "anchors", "incident"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["intersection", "anchors", "incident"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
 
     # adjacent: FULL CLIQUE among included buildings (per locked redefinition —
     # "all buildings that touched the isovist" IS the adjacency criterion)
