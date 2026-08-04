@@ -1,17 +1,29 @@
 """
-Training loop, plus TWO separate orchestration schemes on top of it:
+Training loop, plus THREE separate orchestration schemes on top of it:
 
-  run_scenario()           -- repeated spatial k-fold (the FORMAL pipeline,
-                               used by 07_train_eval.ipynb; feeds evaluate.py's
-                               pre-registered Wilcoxon/Nadeau-Bengio tests).
-  run_scenario_bootstrap() -- bootstrap resampling (used by
-                               07b_train_eval_bootstrap.ipynb; a separate,
-                               parallel exploration, not a replacement).
+  run_scenario()              -- repeated spatial k-fold (the FORMAL
+                                  pipeline, used by 07_train_eval.ipynb;
+                                  feeds evaluate.py's pre-registered
+                                  Wilcoxon/Nadeau-Bengio tests).
+  run_scenario_bootstrap()    -- classic bootstrap resampling WITH
+                                  replacement + dedup (used by
+                                  07b_train_eval_bootstrap.ipynb).
+  run_scenario_random_repeats() -- repeated random re-splits WITHOUT
+                                  replacement, no dedup needed (every
+                                  point used exactly once per repeat).
 
-Encoders trained independently, end-to-end, per scenario, per fold/repeat --
-never shared/frozen across scenarios or folds/repeats. Checkpointed per
-(scenario, head_depth, ablation, fold-or-repeat) combination so a Colab
-disconnect resumes rather than restarting.
+All three are separate, parallel schemes -- none replaces another.
+run_scenario_bootstrap and run_scenario_random_repeats are NOT the same
+thing despite both being "repeated": the former resamples with
+replacement (duplicates possible, hence the dedup step and a smaller
+effective n per repeat); the latter just re-shuffles and re-splits the
+full dataset fresh each repeat (no duplicates, no dedup, full n retained
+every repeat).
+
+Encoders trained independently, end-to-end, per scenario, per fold/repeat
+-- never shared/frozen across scenarios or folds/repeats. Checkpointed
+per (scenario, head_depth, ablation, fold-or-repeat) combination so a
+Colab disconnect resumes rather than restarting.
 """
 import copy
 import json
@@ -367,6 +379,102 @@ def run_scenario_bootstrap(scenario, head_depth, use_ablation, dataset, n_repeat
 
         if verbose:
             print(f"  -- repeat {repeat} (bootstrap n={n} after dedup from {n_total}, "
+                  f"n_train={len(train_df)}, n_val={len(val_df)}, n_test={len(test_df)}) --")
+
+        repeat_history_path = history_dir / f"repeat{repeat}.json"
+        test_metrics, best_state = train_one_fold(
+            scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
+            svg_kwargs, tvg_kwargs, config, device,
+            verbose=verbose, history_path=repeat_history_path,
+        )
+
+        if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
+            torch.save(best_state, best_model_path)
+            best_so_far = {"repeat": repeat,
+                            "val_pr_auc": test_metrics["val_pr_auc"],
+                            "test_pr_auc": test_metrics["pr_auc"],
+                            "test_auroc": test_metrics.get("auroc")}
+            best_model_meta_path.write_text(json.dumps(_to_jsonable(best_so_far), indent=1))
+            if verbose:
+                print(f"    -> new best model for {tag} "
+                      f"(val pr_auc={test_metrics['val_pr_auc']:.4f}, "
+                      f"test pr_auc={test_metrics['pr_auc']:.4f}), saved.")
+
+        results.append({"repeat": repeat, "n_train": len(train_df), "n_val": len(val_df),
+                         "n_test": len(test_df), **test_metrics})
+        results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
+
+    return results
+
+
+def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_repeats, config, svg_kwargs, tvg_kwargs,
+                                 device, checkpoint_dir, verbose=True, seed=42):
+    """Repeated RANDOM train/val/test re-splits -- a THIRD, separate scheme
+    from both run_scenario (spatial k-fold) and run_scenario_bootstrap
+    (bootstrap-with-replacement) above.
+
+    NOT bootstrap: no sampling with replacement, no duplicates, no dedup
+    needed. Every point appears in exactly train, val, OR test within a
+    given repeat -- same disjointness guarantee as k-fold, just re-drawn
+    with a fresh random split each repeat instead of iterating fixed folds.
+
+    Each repeat:
+      1. Shuffle the full dataset (random_state = seed + repeat_idx).
+      2. Split by percentage into train/val/test (config["val_frac"],
+         config["test_frac"]) -- every point used exactly once, nothing
+         dropped, nothing duplicated.
+      3. Train fresh, evaluate on that repeat's held-out test split.
+
+    Across repeats, WHICH points land in train vs. val vs. test changes
+    each time (since the shuffle seed changes), so this still gives you a
+    distribution of scores to look at spread across repeats -- same
+    motivation as bootstrap repeats (a single split's score could be a
+    fluke of which points got shuffled where), just without resampling
+    with replacement.
+
+    Checkpointed per repeat, same resume-on-reconnect behavior as the
+    other two schemes.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"{scenario}_{head_depth}{'_ablation' if use_ablation else ''}"
+    results_path = checkpoint_dir / f"{tag}_results.json"
+    history_dir = checkpoint_dir / f"{tag}_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    results = json.loads(results_path.read_text()) if results_path.exists() else []
+    done_repeats = {r["repeat"] for r in results}
+
+    best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
+    best_so_far = (json.loads(best_model_meta_path.read_text())
+                   if best_model_meta_path.exists() else None)
+
+    index_df = dataset.index_df
+    val_frac = config.get("val_frac", 0.15)
+    test_frac = config.get("test_frac", 0.15)
+
+    for repeat in range(n_repeats):
+        if repeat in done_repeats:
+            continue
+
+        repeat_seed = seed + repeat
+        # plain shuffle, no resampling with replacement -- every point
+        # appears exactly once in this ordering
+        shuffled = index_df.sample(frac=1.0, random_state=repeat_seed)
+        n = len(shuffled)
+        n_val = int(round(n * val_frac))
+        n_test = int(round(n * test_frac))
+
+        val_df = shuffled.iloc[:n_val]
+        test_df = shuffled.iloc[n_val:n_val + n_test]
+        train_df = shuffled.iloc[n_val + n_test:]
+
+        def _items(df):
+            return [dataset[i] for i in df.index]
+
+        if verbose:
+            print(f"  -- repeat {repeat} (random re-split, n={n}, "
                   f"n_train={len(train_df)}, n_val={len(val_df)}, n_test={len(test_df)}) --")
 
         repeat_history_path = history_dir / f"repeat{repeat}.json"

@@ -1,0 +1,29 @@
+# Model config for the random-repeats branch (07c_train_eval_random_repeats.ipynb).
+# Separate from model.yaml (07, k-fold) and model_bootstrap.yaml (07b,
+# bootstrap) so changes here don't affect either of those.
+#
+# Same capacity/regularization as model_bootstrap.yaml -- this branch's
+# purpose is to isolate whether 07b's variance/val-test gap came from the
+# bootstrap resample+dedup step specifically, so architecture is held
+# constant between 07b and 07c on purpose. Change this only if you also
+# want to re-run 07b with matching values for a fair comparison.
+hidden_dim: 128
+fusion_dim: 128
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.45
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+- G
+ablation_scope:
+- B
+- C
+- D
+- E
+- F

@@ -1,0 +1,31 @@
+# Eval config for the random-repeats branch (07c_train_eval_random_repeats.ipynb).
+# Separate from eval.yaml (07, k-fold) and eval_bootstrap.yaml (07b,
+# bootstrap).
+#
+# No id_col/dedup-related settings needed here (unlike bootstrap) --
+# run_scenario_random_repeats never produces duplicates, so there's
+# nothing to dedup. Same n_repeats/val_frac/test_frac/batch_size/etc as
+# eval_bootstrap.yaml on purpose, for a like-for-like comparison against
+# 07b -- see model_random_repeats.yaml's comment for the same reasoning.
+n_repeats: 20
+val_frac: 0.15
+test_frac: 0.15
+batch_size: 128
+epoch_cap: 150
+patience: 40
+lr_patience: 5
+lr: 0.005
+weight_decay: 0.0003
+num_workers: 0
+use_amp: true
+metrics_descriptive_only:
+- pr_auc
+- auroc
+- f1
+- precision
+- recall
+- accuracy
+- bce_loss
+interpretability_methods:
+- attention_weights
+- gnnexplainer
