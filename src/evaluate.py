@@ -12,6 +12,73 @@ from sklearn.metrics import (
     recall_score, accuracy_score, confusion_matrix, log_loss,
 )
 
+def find_optimal_threshold(y_true, y_prob, method="cost_sensitive", fn_cost=10.0, fp_cost=1.0,
+                            grid=None):
+    """Learn a single decision threshold from (val) predictions, to be
+    frozen and reused unchanged at test time -- NOT a per-sample or
+    per-batch adaptive rule. Fixing the threshold on val and applying it
+    as-is to test keeps the usual train/val/test contract intact (no
+    dependence on test-set data), it's just no longer hardcoded at 0.5.
+
+    method="f1"       : threshold maximizing F1 (balanced precision/recall
+                         trade-off, implicit 1:1 cost assumption).
+    method="youden"    : threshold maximizing Youden's J = TPR - FPR
+                         (equivalently sensitivity + specificity - 1).
+                         Distributional/ROC-based, largely rank-based like
+                         AUROC so tends to be less sensitive to calibration
+                         than an F1 scan on an imbalanced positive class.
+    method="cost_sensitive": threshold minimizing
+                         fn_cost * FN + fp_cost * FP. Use this when missing
+                         a crash-risk point (FN) is judged materially worse
+                         than a false alarm (FP) -- the default fn_cost=10
+                         means one miss is weighted like ten false alarms.
+                         Always <= the f1/youden threshold for fn_cost >
+                         fp_cost, since under-predicting is penalized more.
+
+    Returns (threshold, method, score_at_threshold). If y_true has only
+    one class present (can happen on a tiny/unlucky val split), returns
+    threshold=0.5 with method="fallback_no_signal" rather than optimizing
+    over a meaningless grid.
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+
+    if len(np.unique(y_true)) < 2:
+        return 0.5, "fallback_no_signal", float("nan")
+
+    if grid is None:
+        # candidate thresholds anchored to the actual predicted
+        # probabilities present (plus a fine regular grid) so the scan
+        # doesn't miss the interesting region for a poorly-calibrated model
+        grid = np.unique(np.concatenate([
+            np.linspace(0.01, 0.99, 197),
+            np.clip(y_prob, 1e-6, 1 - 1e-6),
+        ]))
+
+    best_t, best_score = 0.5, -np.inf
+    for t in grid:
+        y_pred = (y_prob >= t).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+        if method == "f1":
+            score = f1_score(y_true, y_pred, zero_division=0)
+        elif method == "youden":
+            tpr = tp / (tp + fn) if (tp + fn) else 0.0
+            fpr = fp / (fp + tn) if (fp + tn) else 0.0
+            score = tpr - fpr
+        elif method == "cost_sensitive":
+            # minimize cost <=> maximize negative cost, so both branches
+            # of this loop can share the same "pick max score" logic below
+            score = -(fn_cost * fn + fp_cost * fp)
+        else:
+            raise ValueError(f"unknown method: {method!r}")
+
+        if score > best_score:
+            best_t, best_score = t, score
+
+    return float(best_t), method, float(best_score)
+
+
 def compute_metrics(y_true, y_prob, threshold=0.5):
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
@@ -37,15 +104,32 @@ def compute_metrics(y_true, y_prob, threshold=0.5):
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "bce_loss": bce_loss,
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        "threshold_used": float(threshold),
     }
 
 
 def aggregate_fold_results(fold_metric_dicts):
-    """List of per-fold metric dicts -> {metric: (mean, std)}."""
+    """List of per-fold metric dicts -> {metric: (mean, std)}.
+
+    Non-numeric fields (e.g. "threshold_method", a string like
+    "cost_sensitive") are skipped here rather than crashing np.mean --
+    there's no meaningful mean/std of a category label. Use
+    summarize_categorical_field below to report those instead."""
     keys = fold_metric_dicts[0].keys()
+    numeric_keys = [k for k in keys if isinstance(fold_metric_dicts[0][k], (int, float, np.integer, np.floating))
+                     and not isinstance(fold_metric_dicts[0][k], bool)]
     return {k: (float(np.mean([d[k] for d in fold_metric_dicts])),
                 float(np.std([d[k] for d in fold_metric_dicts])))
-            for k in keys}
+            for k in numeric_keys}
+
+
+def summarize_categorical_field(fold_metric_dicts, field):
+    """List of per-fold metric dicts -> {value: count} for a non-numeric
+    field like "threshold_method" (e.g. confirms every repeat actually
+    used the intended method, or shows fallback_no_signal firing on a
+    small/unlucky val split)."""
+    from collections import Counter
+    return dict(Counter(d.get(field) for d in fold_metric_dicts))
 
 
 def nadeau_bengio_test(scores_a, scores_b, n_train, n_test):

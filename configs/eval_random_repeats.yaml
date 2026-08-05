@@ -4,16 +4,50 @@
 #
 # No id_col/dedup-related settings needed here (unlike bootstrap) --
 # run_scenario_random_repeats never produces duplicates, so there's
-# nothing to dedup. Same n_repeats/val_frac/test_frac/batch_size/etc as
-# eval_bootstrap.yaml on purpose, for a like-for-like comparison against
-# 07b -- see model_random_repeats.yaml's comment for the same reasoning.
+# nothing to dedup.
+#
+# UPDATED for the 60/20/20 + adaptive-threshold direction: val_frac/
+# test_frac moved from 0.15/0.15 (70/15/15) to 0.20/0.20 (60/20/20).
+# No longer matched to eval_bootstrap.yaml on purpose -- this branch has
+# diverged from "isolate bootstrap's dedup effect" into its own primary
+# pipeline; compare against 07b's numbers with that in mind, since the
+# split ratio is no longer identical between the two.
 n_repeats: 20
-val_frac: 0.15
-test_frac: 0.15
-batch_size: 128
-epoch_cap: 150
+val_frac: 0.20
+test_frac: 0.20
+
+# Stratification: run_scenario_random_repeats splits positives/negatives
+# separately by the ratios above whenever label_col is present on
+# dataset.index_df, so every split's positive rate matches the source
+# ratio instead of drifting by chance. target_pos_frac left null =
+# preserve the natural/global positive rate as-is (no rebalancing) --
+# set to e.g. 0.25 later if you want a milder-than-natural imbalance,
+# per-split, without ever crossing points between splits.
+label_col: label
+target_pos_frac: null
+
+# Warm-up + early stopping (already supported by train_one_fold, just
+# surfaced explicitly here rather than left to config.get() defaults).
+# warmup_epochs: scheduler/early-stopping patience counter doesn't start
+# ticking until this many epochs have passed, so the model isn't
+# penalized for its first N epochs of finding its footing.
+warmup_epochs: 100
+epoch_cap: 400
 patience: 40
-lr_patience: 5
+lr_patience: 10
+
+# Adaptive threshold: "fixed" reproduces the old hardcoded-0.5 behavior.
+# "cost_sensitive" is the default here per the crash-safety framing (a
+# missed crash-risk point costs more than a false alarm) -- threshold_fn_cost
+# / threshold_fp_cost set that 10:1 weighting. Switch to "f1" or "youden"
+# for the balanced (no explicit cost asymmetry) threshold instead; every
+# repeat's chosen threshold + method is logged in that repeat's result
+# row (threshold_used, threshold_method) regardless of which you pick.
+threshold_method: cost_sensitive
+threshold_fn_cost: 10.0
+threshold_fp_cost: 1.0
+
+batch_size: 128
 lr: 0.005
 weight_decay: 0.0003
 num_workers: 0
@@ -26,6 +60,8 @@ metrics_descriptive_only:
 - recall
 - accuracy
 - bce_loss
+- threshold_used
+- threshold_method
 interpretability_methods:
 - attention_weights
 - gnnexplainer

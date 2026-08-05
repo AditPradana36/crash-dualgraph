@@ -30,6 +30,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -86,7 +87,18 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
 
     verbose: print train_loss / val_pr_auc / val_auroc each epoch.
     history_path: if given, write the full per-epoch history to this JSON
-    path after training (for later plotting -- see plot_fold_history)."""
+    path after training (for later plotting -- see plot_fold_history).
+
+    Decision threshold: config["threshold_method"] controls how the
+    classification threshold is chosen (default "fixed", i.e. the old
+    hardcoded 0.5 behavior, preserved so existing 07/07b runs are
+    unaffected unless they opt in). "f1" / "youden" / "cost_sensitive"
+    learn a threshold from the VAL split's predictions at the best
+    (early-stopped) epoch and freeze it for the test-split evaluation --
+    see evaluate.find_optimal_threshold's docstring for what each method
+    optimizes. config["threshold_fn_cost"] / config["threshold_fp_cost"]
+    are only used by "cost_sensitive" (default 10:1, i.e. missing a
+    crash-risk point is weighted like ten false alarms)."""
     stats = ds.fit_normalization([i[0] for i in train_items], [i[1] for i in train_items])
 
     def _norm(items):
@@ -195,9 +207,31 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
                     break
 
     model.load_state_dict(best_state)
+
+    # Threshold: re-run the best (early-stopped) epoch's VAL predictions
+    # once more here (cheap -- val is small, one forward pass) to fit the
+    # threshold on the exact weights being evaluated. Frozen and reused
+    # unchanged on test below -- test-set data never touches threshold
+    # selection, only best_state weights + val predictions do.
+    threshold_method = config.get("threshold_method", "fixed")
+    if threshold_method == "fixed":
+        chosen_threshold, threshold_method_used, threshold_score = config.get("threshold", 0.5), "fixed", float("nan")
+    else:
+        val_true_best, val_prob_best = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
+                                                         is_cuda=is_cuda, use_amp=use_amp)
+        chosen_threshold, threshold_method_used, threshold_score = ev.find_optimal_threshold(
+            val_true_best, val_prob_best, method=threshold_method,
+            fn_cost=config.get("threshold_fn_cost", 10.0),
+            fp_cost=config.get("threshold_fp_cost", 1.0),
+        )
+        if verbose:
+            print(f"    threshold ({threshold_method_used}) = {chosen_threshold:.4f} "
+                  f"(val score={threshold_score:.4f})")
+
     test_true, test_prob = _run_epoch_eval(model, scenario, test_loader, device, svg_nt, tvg_nt,
                                             is_cuda=is_cuda, use_amp=use_amp)
-    test_metrics = ev.compute_metrics(test_true, test_prob)
+    test_metrics = ev.compute_metrics(test_true, test_prob, threshold=chosen_threshold)
+    test_metrics["threshold_method"] = threshold_method_used
     # loss at the best (early-stopped) epoch, kept separate from
     # test_metrics["bce_loss"] which is BCE computed on the test split
     test_metrics["train_loss"] = best_train_loss
@@ -411,6 +445,58 @@ def run_scenario_bootstrap(scenario, head_depth, use_ablation, dataset, n_repeat
     return results
 
 
+def _stratified_split(df, label_col, val_frac, test_frac, seed, target_pos_frac=None):
+    """Split df into train/val/test, preserving (or gently nudging) the
+    positive-class fraction in every split -- unlike a plain
+    `.sample(frac=1)` shuffle, which can drift the positive rate between
+    splits by chance on an imbalanced dataset (small positive counts make
+    that drift proportionally large).
+
+    Splits each class SEPARATELY by the same val_frac/test_frac
+    percentages, then concatenates -- so every split's positive rate
+    matches the class's split ratio by construction, not by luck.
+
+    target_pos_frac: None (default) preserves the natural/global positive
+    rate as-is in every split -- true stratification, no rebalancing.
+    If given (e.g. 0.3), each split's positive class is gently upsampled
+    WITH replacement within that split only (never crossing into another
+    split, so no train/test leakage) until it reaches roughly that
+    fraction -- "flexible but not too extreme" means this stays a knob
+    you dial in later rather than forcing anything now; leave it None
+    until you have a concrete target ratio in mind.
+    """
+    rng = np.random.default_rng(seed)
+    pos_df = df[df[label_col] == 1]
+    neg_df = df[df[label_col] == 0]
+
+    def _split_one(class_df):
+        shuffled = class_df.sample(frac=1.0, random_state=seed)
+        n = len(shuffled)
+        n_val = int(round(n * val_frac))
+        n_test = int(round(n * test_frac))
+        return shuffled.iloc[:n_val], shuffled.iloc[n_val:n_val + n_test], shuffled.iloc[n_val + n_test:]
+
+    pos_val, pos_test, pos_train = _split_one(pos_df)
+    neg_val, neg_test, neg_train = _split_one(neg_df)
+
+    def _maybe_upsample(pos_part, neg_part):
+        if target_pos_frac is None or len(pos_part) == 0:
+            return pos_part
+        # solve for target positive COUNT given the (fixed) negative count
+        # in this split: pos_target / (pos_target + n_neg) = target_pos_frac
+        n_neg = len(neg_part)
+        target_n_pos = int(round((target_pos_frac * n_neg) / max(1 - target_pos_frac, 1e-6)))
+        if target_n_pos <= len(pos_part):
+            return pos_part  # already at/above target -- never downsample here
+        extra_idx = rng.choice(pos_part.index, size=target_n_pos - len(pos_part), replace=True)
+        return pd.concat([pos_part, pos_part.loc[extra_idx]])
+
+    val_df = pd.concat([_maybe_upsample(pos_val, neg_val), neg_val]).sample(frac=1.0, random_state=seed)
+    test_df = pd.concat([_maybe_upsample(pos_test, neg_test), neg_test]).sample(frac=1.0, random_state=seed + 1)
+    train_df = pd.concat([_maybe_upsample(pos_train, neg_train), neg_train]).sample(frac=1.0, random_state=seed + 2)
+    return train_df, val_df, test_df
+
+
 def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_repeats, config, svg_kwargs, tvg_kwargs,
                                  device, checkpoint_dir, verbose=True, seed=42):
     """Repeated RANDOM train/val/test re-splits -- a THIRD, separate scheme
@@ -423,10 +509,19 @@ def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_r
     with a fresh random split each repeat instead of iterating fixed folds.
 
     Each repeat:
-      1. Shuffle the full dataset (random_state = seed + repeat_idx).
-      2. Split by percentage into train/val/test (config["val_frac"],
+      1. Split by percentage into train/val/test (config["val_frac"],
          config["test_frac"]) -- every point used exactly once, nothing
          dropped, nothing duplicated.
+      2. STRATIFIED by config["label_col"] (default "label") when that
+         column exists on dataset.index_df: positives and negatives are
+         each split by the same percentages independently, so every
+         split's positive rate matches the source class ratio instead of
+         drifting by chance the way a plain shuffle-then-slice can on a
+         small/imbalanced positive class. Falls back to the old plain
+         shuffle if label_col isn't present. config["target_pos_frac"]
+         (default None = preserve natural ratio) optionally nudges the
+         positive fraction per split via in-split upsampling -- see
+         _stratified_split's docstring.
       3. Train fresh, evaluate on that repeat's held-out test split.
 
     Across repeats, WHICH points land in train vs. val vs. test changes
@@ -455,31 +550,44 @@ def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_r
                    if best_model_meta_path.exists() else None)
 
     index_df = dataset.index_df
-    val_frac = config.get("val_frac", 0.15)
-    test_frac = config.get("test_frac", 0.15)
+    val_frac = config.get("val_frac", 0.2)
+    test_frac = config.get("test_frac", 0.2)
+    label_col = config.get("label_col", "label")
+    target_pos_frac = config.get("target_pos_frac", None)
+    stratify = label_col in index_df.columns
 
     for repeat in range(n_repeats):
         if repeat in done_repeats:
             continue
 
         repeat_seed = seed + repeat
-        # plain shuffle, no resampling with replacement -- every point
-        # appears exactly once in this ordering
-        shuffled = index_df.sample(frac=1.0, random_state=repeat_seed)
-        n = len(shuffled)
-        n_val = int(round(n * val_frac))
-        n_test = int(round(n * test_frac))
 
-        val_df = shuffled.iloc[:n_val]
-        test_df = shuffled.iloc[n_val:n_val + n_test]
-        train_df = shuffled.iloc[n_val + n_test:]
+        if stratify:
+            train_df, val_df, test_df = _stratified_split(
+                index_df, label_col, val_frac, test_frac, repeat_seed, target_pos_frac)
+        else:
+            # fallback: plain shuffle, no resampling with replacement --
+            # every point appears exactly once in this ordering
+            shuffled = index_df.sample(frac=1.0, random_state=repeat_seed)
+            n = len(shuffled)
+            n_val = int(round(n * val_frac))
+            n_test = int(round(n * test_frac))
+            val_df = shuffled.iloc[:n_val]
+            test_df = shuffled.iloc[n_val:n_val + n_test]
+            train_df = shuffled.iloc[n_val + n_test:]
+
+        n = len(train_df) + len(val_df) + len(test_df)
 
         def _items(df):
             return [dataset[i] for i in df.index]
 
         if verbose:
-            print(f"  -- repeat {repeat} (random re-split, n={n}, "
-                  f"n_train={len(train_df)}, n_val={len(val_df)}, n_test={len(test_df)}) --")
+            split_kind = f"stratified by '{label_col}'" if stratify else "plain shuffle (no label_col found)"
+            pos_rates = (f", pos_rate train/val/test="
+                         f"{train_df[label_col].mean():.3f}/{val_df[label_col].mean():.3f}/{test_df[label_col].mean():.3f}"
+                         if stratify else "")
+            print(f"  -- repeat {repeat} (random re-split, {split_kind}, n={n}, "
+                  f"n_train={len(train_df)}, n_val={len(val_df)}, n_test={len(test_df)}{pos_rates}) --")
 
         repeat_history_path = history_dir / f"repeat{repeat}.json"
         test_metrics, best_state = train_one_fold(
