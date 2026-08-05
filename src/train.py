@@ -619,30 +619,25 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
                                      device, checkpoint_dir, verbose=True, seed=42):
     """Repeated 70:30 TRAIN/TEST split -- a FOURTH, separate scheme from
     run_scenario (spatial k-fold), run_scenario_bootstrap, and
-    run_scenario_random_repeats above. Matches the split RATIO reported in
-    Lei et al. 2024 (Computers, Environment and Urban Systems), so results
-    here are comparable to that paper's numbers on that specific axis.
+    run_scenario_random_repeats above. Matches BOTH the split ratio AND the
+    protocol reported in Lei et al. 2024 (Computers, Environment and Urban
+    Systems): there is NO separate val split here -- only train (70%) and
+    test (30%). Test plays double duty as val, exactly like the paper's
+    own script (gnn_building_prediction.ipynb: `if test_rmse <
+    best_test_rmse: ... best_model = model.state_dict()`).
 
-    IMPORTANT DIFFERENCE FROM THE PAPER'S OWN SCRIPT: Lei et al.'s notebook
-    (gnn_building_prediction.ipynb) uses the 30% test split itself for
-    early-stopping / best-checkpoint selection (`if test_rmse < best_test_rmse:
-    ... best_model = model.state_dict()`) -- i.e. test leaks into model
-    selection, so their reported "test" number is biased optimistic. This
-    function does NOT reproduce that leak. Instead:
-
-      1. Outer split: config["test_frac"] (default 0.30) held out as TEST,
-         via _stratified_split -- disjoint, never touched again until final
-         evaluation.
-      2. Inner split: the remaining 70% is itself split into TRAIN/VAL via
-         _stratified_split (config["internal_val_frac"], default 0.15 of
-         that 70%) -- VAL is used purely for early stopping + threshold
-         fitting inside train_one_fold, exactly like the other three
-         schemes. TEST still never influences anything upstream of the
-         final metrics computation.
-
-    So the reported held-out fraction matches the paper's 30% convention,
-    but the "test" number here is a genuinely uncontaminated estimate --
-    stricter than the paper's, not the same statistical object.
+    WHAT THIS MEANS, EXPLICITLY: the 30% test set is used to (a) drive
+    early stopping, (b) select which epoch's weights become best_state,
+    and (c) [if threshold_method != "fixed"] fit the decision threshold --
+    then the SAME 30% is what test_metrics reports. That is a real
+    train/test contract violation (test data influences model selection),
+    not a stricter evaluation than the other three schemes -- it is a
+    weaker one, deliberately chosen here to mirror the paper's reported
+    numbers on a like-for-like protocol basis, not just a like-for-like
+    split ratio. Do not treat this branch's numbers as directly comparable
+    to 07/07b/07c's val-driven-selection test scores without accounting
+    for this difference -- see the earlier discussion of this exact issue
+    in the paper's own notebook.
 
     Threshold: config["threshold_method"] defaults to "fixed" (0.5) via
     train_one_fold's own default -- set explicitly in configs/eval_70_30.yaml
@@ -666,7 +661,9 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
     results = json.loads(results_path.read_text()) if results_path.exists() else []
     done_repeats = {r["repeat"] for r in results}
 
-    # Same val-based (not test-based) selection rule as the other schemes.
+    # "val_pr_auc" below is still the name train_one_fold returns -- but
+    # since val IS test in this scheme, it's numerically identical to
+    # test_metrics["pr_auc"] for the SAME epoch, not an independent check.
     best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
     best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
     best_so_far = (json.loads(best_model_meta_path.read_text())
@@ -674,7 +671,6 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
 
     index_df = dataset.index_df
     test_frac = config.get("test_frac", 0.30)
-    internal_val_frac = config.get("internal_val_frac", 0.15)
     label_col = config.get("label_col", "label")
     target_pos_frac = config.get("target_pos_frac", None)
     stratify = label_col in index_df.columns
@@ -686,43 +682,38 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
         repeat_seed = seed + repeat
 
         if stratify:
-            # Outer: 70/30 train_full/test -- val_frac=0.0 means _stratified_split's
-            # "val" bucket comes back empty, so this is a plain two-way split.
-            train_full_df, _, test_df = _stratified_split(
+            # Plain 70/30 split -- val_frac=0.0 means _stratified_split's
+            # "val" bucket comes back empty, so this is a two-way split.
+            train_df, _, test_df = _stratified_split(
                 index_df, label_col, val_frac=0.0, test_frac=test_frac,
                 seed=repeat_seed, target_pos_frac=target_pos_frac)
-            # Inner: split the 70% train_full into train/val (test_frac=0.0 here
-            # for the same reason) -- test_df above is untouched by this call.
-            train_df, val_df, _ = _stratified_split(
-                train_full_df, label_col, val_frac=internal_val_frac, test_frac=0.0,
-                seed=repeat_seed + 1, target_pos_frac=target_pos_frac)
         else:
             shuffled = index_df.sample(frac=1.0, random_state=repeat_seed)
             n = len(shuffled)
             n_test = int(round(n * test_frac))
             test_df = shuffled.iloc[:n_test]
-            train_full_df = shuffled.iloc[n_test:]
-            n_val = int(round(len(train_full_df) * internal_val_frac))
-            val_df = train_full_df.iloc[:n_val]
-            train_df = train_full_df.iloc[n_val:]
+            train_df = shuffled.iloc[n_test:]
 
-        n = len(train_df) + len(val_df) + len(test_df)
+        n = len(train_df) + len(test_df)
 
         def _items(df):
             return [dataset[i] for i in df.index]
 
         if verbose:
             split_kind = f"stratified by '{label_col}'" if stratify else "plain shuffle (no label_col found)"
-            pos_rates = (f", pos_rate train/val/test="
-                         f"{train_df[label_col].mean():.3f}/{val_df[label_col].mean():.3f}/{test_df[label_col].mean():.3f}"
+            pos_rates = (f", pos_rate train/test="
+                         f"{train_df[label_col].mean():.3f}/{test_df[label_col].mean():.3f}"
                          if stratify else "")
-            print(f"  -- repeat {repeat} (70:30 train/test, {split_kind}, n={n}, "
-                  f"n_train={len(train_df)}, n_val={len(val_df)} [internal, from the 70%], "
-                  f"n_test={len(test_df)}{pos_rates}) --")
+            print(f"  -- repeat {repeat} (70:30 train/test, NO separate val -- "
+                  f"test doubles as val, {split_kind}, n={n}, "
+                  f"n_train={len(train_df)}, n_test={len(test_df)}{pos_rates}) --")
 
         repeat_history_path = history_dir / f"repeat{repeat}.json"
+        # test_items passed as BOTH val_items and test_items -- this is the
+        # explicit, intentional leak described in the docstring above.
+        test_items_list = _items(test_df)
         test_metrics, best_state = train_one_fold(
-            scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
+            scenario, head_depth, use_ablation, _items(train_df), test_items_list, test_items_list,
             svg_kwargs, tvg_kwargs, config, device,
             verbose=verbose, history_path=repeat_history_path,
         )
@@ -737,12 +728,11 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
             best_model_meta_path.write_text(json.dumps(_to_jsonable(best_so_far), indent=1))
             if verbose:
                 print(f"    -> new best model for {tag} "
-                      f"(val pr_auc={test_metrics['val_pr_auc']:.4f}, "
-                      f"test pr_auc={test_metrics['pr_auc']:.4f}, "
+                      f"(test/val pr_auc={test_metrics['val_pr_auc']:.4f}, "
                       f"test accuracy={test_metrics.get('accuracy', float('nan')):.4f}), saved.")
 
-        results.append({"repeat": repeat, "n_train": len(train_df), "n_val": len(val_df),
-                         "n_test": len(test_df), **test_metrics})
+        results.append({"repeat": repeat, "n_train": len(train_df), "n_test": len(test_df),
+                         **test_metrics})
         results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
 
     return results

@@ -1,13 +1,14 @@
-# Eval config for the 70:30 train/test branch (proposed 07d_train_eval_70_30.ipynb).
+# Eval config for the 70:30 train/test branch (07d_train_eval_70_30.ipynb).
 # A FOURTH scheme, separate from eval.yaml (07, k-fold), eval_bootstrap.yaml
 # (07b), and eval_random_repeats.yaml (07c). See
 # train.run_scenario_train_test_repeats's docstring for the full design
-# rationale -- short version: matches Lei et al. 2024's reported 70:30
-# split ratio, WITHOUT reproducing their test-set-leaks-into-early-stopping
-# bug (their notebook picks the best checkpoint using test_rmse each
-# epoch). Here, test_frac is the true held-out 30%; internal_val_frac
-# carves a val split out of the 70% train portion ONLY, used purely for
-# early stopping + threshold fitting -- test never touches selection.
+# rationale -- short version: matches Lei et al. 2024's split ratio AND
+# their protocol: NO separate val split. Only train (70%) / test (30%).
+# Test plays double duty as val -- it drives early stopping and
+# best-checkpoint selection, then the SAME 30% is what gets reported.
+# This is an intentional, explicit train/test contract relaxation (test
+# data influences model selection), matching the paper's own script
+# exactly, not a stricter evaluation than the other three schemes.
 #
 # No k_folds/n_repeats-as-resample here -- like random_repeats, every
 # point is used exactly once per repeat (no bootstrap duplication).
@@ -17,7 +18,6 @@
 # Descriptive aggregates (mean +/- std across repeats) only.
 n_repeats: 10
 test_frac: 0.30
-internal_val_frac: 0.15
 
 label_col: label
 target_pos_frac: null
