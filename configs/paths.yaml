@@ -7,8 +7,8 @@ negative_front_view_dir: /content/drive/MyDrive/crash-dualgraph/warsaw/data/nega
 negative_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/warsaw/negative/panorama/metadata_outofrange_removed.csv
 negative_points_csv: /content/drive/MyDrive/crash-dualgraph/data/warsaw/negative/points/negative_points.csv
 interim_dir: /content/drive/MyDrive/crash-dualgraph/data/warsaw/interim
-processed_dir: /content/drive/MyDrive/crash-dualgraph/warsaw/data/processed
-outputs_dir: /content/drive/MyDrive/crash-dualgraph/warsaw/data/outputs
+processed_dir: /content/drive/MyDrive/crash-dualgraph/data/warsaw/processed
+outputs_dir: /content/drive/MyDrive/crash-dualgraph/data/warsaw/outputs
 random_seed: 42
 approx_n_positive: 460
 approx_n_negative: 460
