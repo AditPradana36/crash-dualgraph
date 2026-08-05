@@ -1,0 +1,68 @@
+# Eval config for the 70:30 train/test branch (proposed 07d_train_eval_70_30.ipynb).
+# A FOURTH scheme, separate from eval.yaml (07, k-fold), eval_bootstrap.yaml
+# (07b), and eval_random_repeats.yaml (07c). See
+# train.run_scenario_train_test_repeats's docstring for the full design
+# rationale -- short version: matches Lei et al. 2024's reported 70:30
+# split ratio, WITHOUT reproducing their test-set-leaks-into-early-stopping
+# bug (their notebook picks the best checkpoint using test_rmse each
+# epoch). Here, test_frac is the true held-out 30%; internal_val_frac
+# carves a val split out of the 70% train portion ONLY, used purely for
+# early stopping + threshold fitting -- test never touches selection.
+#
+# No k_folds/n_repeats-as-resample here -- like random_repeats, every
+# point is used exactly once per repeat (no bootstrap duplication).
+# No significance_test_*/correction_*/pairs section -- same reasoning as
+# eval_bootstrap.yaml/eval_random_repeats.yaml: Wilcoxon/Nadeau-Bengio are
+# built for paired k-fold scores, not independent random-repeat scores.
+# Descriptive aggregates (mean +/- std across repeats) only.
+n_repeats: 10
+test_frac: 0.30
+internal_val_frac: 0.15
+
+label_col: label
+target_pos_frac: null
+
+# Threshold fixed at 0.5 (not learned) per the current experiment design --
+# explicit here rather than left to train_one_fold's own default, so it's
+# visible in the config rather than implicit.
+threshold_method: fixed
+threshold: 0.5
+
+# PR-AUC is the primary metric for checkpoint/model selection (val_pr_auc
+# drives early stopping + best-model selection in train_one_fold /
+# run_scenario_train_test_repeats, same as every other scheme). Accuracy
+# (and auroc/f1/precision/recall) are reported alongside every repeat via
+# evaluate.compute_metrics -- nothing extra to configure for that, they're
+# always computed.
+primary_metric: pr_auc
+metrics_descriptive_only:
+- pr_auc
+- auroc
+- accuracy
+- f1
+- precision
+- recall
+- bce_loss
+- threshold_used
+- threshold_method
+
+batch_size: 128
+epoch_cap: 350
+# warmup_epochs: early-stopping's no_improve counter (and the LR scheduler)
+# don't start ticking until this many epochs have passed -- 75 gives the
+# smaller (07-baseline-capacity) model room to find its footing before
+# patience starts counting against it. With epoch_cap now 350 and
+# patience=30, early stopping has a real window to act (earliest possible
+# stop = warmup_epochs + patience = epoch 105, leaving 245 epochs of
+# headroom before the cap) rather than being squeezed against epoch_cap
+# like the earlier 150/75/50 combination was.
+warmup_epochs: 75
+patience: 30
+lr_patience: 5
+lr: 0.005
+weight_decay: 0.0001
+num_workers: 0
+use_amp: true
+interpretability_methods:
+- attention_weights
+- gnnexplainer

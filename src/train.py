@@ -613,3 +613,136 @@ def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_r
         results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
 
     return results
+
+
+def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset, n_repeats, config, svg_kwargs, tvg_kwargs,
+                                     device, checkpoint_dir, verbose=True, seed=42):
+    """Repeated 70:30 TRAIN/TEST split -- a FOURTH, separate scheme from
+    run_scenario (spatial k-fold), run_scenario_bootstrap, and
+    run_scenario_random_repeats above. Matches the split RATIO reported in
+    Lei et al. 2024 (Computers, Environment and Urban Systems), so results
+    here are comparable to that paper's numbers on that specific axis.
+
+    IMPORTANT DIFFERENCE FROM THE PAPER'S OWN SCRIPT: Lei et al.'s notebook
+    (gnn_building_prediction.ipynb) uses the 30% test split itself for
+    early-stopping / best-checkpoint selection (`if test_rmse < best_test_rmse:
+    ... best_model = model.state_dict()`) -- i.e. test leaks into model
+    selection, so their reported "test" number is biased optimistic. This
+    function does NOT reproduce that leak. Instead:
+
+      1. Outer split: config["test_frac"] (default 0.30) held out as TEST,
+         via _stratified_split -- disjoint, never touched again until final
+         evaluation.
+      2. Inner split: the remaining 70% is itself split into TRAIN/VAL via
+         _stratified_split (config["internal_val_frac"], default 0.15 of
+         that 70%) -- VAL is used purely for early stopping + threshold
+         fitting inside train_one_fold, exactly like the other three
+         schemes. TEST still never influences anything upstream of the
+         final metrics computation.
+
+    So the reported held-out fraction matches the paper's 30% convention,
+    but the "test" number here is a genuinely uncontaminated estimate --
+    stricter than the paper's, not the same statistical object.
+
+    Threshold: config["threshold_method"] defaults to "fixed" (0.5) via
+    train_one_fold's own default -- set explicitly in configs/eval_70_30.yaml
+    so it's visible rather than implicit. PR-AUC is the primary metric
+    (config-driven, same as the other schemes); compute_metrics also
+    returns accuracy/auroc/f1/etc. every repeat, so nothing is lost.
+
+    Same checkpoint/resume-on-reconnect contract as the other three
+    schemes: repeats already present in results.json are skipped on re-run.
+    Descriptive aggregates only (mean +/- std across repeats) -- like
+    bootstrap/random-repeats, this doesn't feed evaluate.py's paired
+    k-fold significance tests (see run_scenario's docstring for why).
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"{scenario}_{head_depth}{'_ablation' if use_ablation else ''}"
+    results_path = checkpoint_dir / f"{tag}_results.json"
+    history_dir = checkpoint_dir / f"{tag}_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    results = json.loads(results_path.read_text()) if results_path.exists() else []
+    done_repeats = {r["repeat"] for r in results}
+
+    # Same val-based (not test-based) selection rule as the other schemes.
+    best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
+    best_so_far = (json.loads(best_model_meta_path.read_text())
+                   if best_model_meta_path.exists() else None)
+
+    index_df = dataset.index_df
+    test_frac = config.get("test_frac", 0.30)
+    internal_val_frac = config.get("internal_val_frac", 0.15)
+    label_col = config.get("label_col", "label")
+    target_pos_frac = config.get("target_pos_frac", None)
+    stratify = label_col in index_df.columns
+
+    for repeat in range(n_repeats):
+        if repeat in done_repeats:
+            continue
+
+        repeat_seed = seed + repeat
+
+        if stratify:
+            # Outer: 70/30 train_full/test -- val_frac=0.0 means _stratified_split's
+            # "val" bucket comes back empty, so this is a plain two-way split.
+            train_full_df, _, test_df = _stratified_split(
+                index_df, label_col, val_frac=0.0, test_frac=test_frac,
+                seed=repeat_seed, target_pos_frac=target_pos_frac)
+            # Inner: split the 70% train_full into train/val (test_frac=0.0 here
+            # for the same reason) -- test_df above is untouched by this call.
+            train_df, val_df, _ = _stratified_split(
+                train_full_df, label_col, val_frac=internal_val_frac, test_frac=0.0,
+                seed=repeat_seed + 1, target_pos_frac=target_pos_frac)
+        else:
+            shuffled = index_df.sample(frac=1.0, random_state=repeat_seed)
+            n = len(shuffled)
+            n_test = int(round(n * test_frac))
+            test_df = shuffled.iloc[:n_test]
+            train_full_df = shuffled.iloc[n_test:]
+            n_val = int(round(len(train_full_df) * internal_val_frac))
+            val_df = train_full_df.iloc[:n_val]
+            train_df = train_full_df.iloc[n_val:]
+
+        n = len(train_df) + len(val_df) + len(test_df)
+
+        def _items(df):
+            return [dataset[i] for i in df.index]
+
+        if verbose:
+            split_kind = f"stratified by '{label_col}'" if stratify else "plain shuffle (no label_col found)"
+            pos_rates = (f", pos_rate train/val/test="
+                         f"{train_df[label_col].mean():.3f}/{val_df[label_col].mean():.3f}/{test_df[label_col].mean():.3f}"
+                         if stratify else "")
+            print(f"  -- repeat {repeat} (70:30 train/test, {split_kind}, n={n}, "
+                  f"n_train={len(train_df)}, n_val={len(val_df)} [internal, from the 70%], "
+                  f"n_test={len(test_df)}{pos_rates}) --")
+
+        repeat_history_path = history_dir / f"repeat{repeat}.json"
+        test_metrics, best_state = train_one_fold(
+            scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
+            svg_kwargs, tvg_kwargs, config, device,
+            verbose=verbose, history_path=repeat_history_path,
+        )
+
+        if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
+            torch.save(best_state, best_model_path)
+            best_so_far = {"repeat": repeat,
+                            "val_pr_auc": test_metrics["val_pr_auc"],
+                            "test_pr_auc": test_metrics["pr_auc"],
+                            "test_accuracy": test_metrics.get("accuracy"),
+                            "test_auroc": test_metrics.get("auroc")}
+            best_model_meta_path.write_text(json.dumps(_to_jsonable(best_so_far), indent=1))
+            if verbose:
+                print(f"    -> new best model for {tag} "
+                      f"(val pr_auc={test_metrics['val_pr_auc']:.4f}, "
+                      f"test pr_auc={test_metrics['pr_auc']:.4f}, "
+                      f"test accuracy={test_metrics.get('accuracy', float('nan')):.4f}), saved.")
+
+        results.append({"repeat": repeat, "n_train": len(train_df), "n_val": len(val_df),
+                         "n_test": len(test_df), **test_metrics})
+        results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
+
+    return results

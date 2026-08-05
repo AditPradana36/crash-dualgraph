@@ -1,0 +1,33 @@
+# Model config for the 70:30 train/test branch (proposed 07d_train_eval_70_30.ipynb).
+# Separate from model.yaml (07), model_bootstrap.yaml (07b), and
+# model_random_repeats.yaml (07c).
+#
+# DELIBERATELY matched to model.yaml's capacity (hidden_dim=64,
+# dropout=0.35) -- the 07 baseline -- rather than 07b/c's larger
+# hidden_dim=128/dropout=0.45. This experiment is testing whether the
+# SPLIT SCHEME (70:30, matching Lei et al. 2024's reported ratio) changes
+# the picture, not whether more capacity does -- 07b/c already explored
+# the capacity axis and were unsatisfactory, so keeping capacity fixed at
+# the 07 baseline here isolates the one variable actually being tested.
+# Revisit / bump to 128 if this scheme's own history logs show the same
+# train-loss-falls-val-plateaus overfitting pattern documented in 07b's.
+hidden_dim: 64
+fusion_dim: 64
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.35
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+- G
+ablation_scope:
+- B
+- C
+- D
+- E
+- F
