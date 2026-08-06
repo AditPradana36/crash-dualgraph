@@ -67,10 +67,33 @@ def run_forward(model, scenario, svg_batch, tvg_batch, svg_node_types, tvg_node_
     return model(svg_batch, tvg_batch, svg_bd, tvg_bd)
 
 
+def run_forward_unified(model, merged_batch, unified_node_types):
+    """Scenario F's forward path -- ONE merged batch, ONE batch_dict, no
+    separate svg/tvg objects (see unified_graph.py / graph_datasets.
+    collate_pairs_unified). Kept as its own function rather than folded
+    into run_forward since the call signature genuinely differs (one
+    graph in, not two) -- forcing it through run_forward's two-graph
+    signature would mean passing None for the unused slot and relying on
+    scenario-string branching to know which None means what, which is
+    more error-prone than just having a dedicated function scenario F's
+    callers use instead."""
+    batch_dict = {nt: merged_batch[nt].batch for nt in unified_node_types}
+    return model(merged_batch, batch_dict)
+
+
 def _run_epoch_eval(model, scenario, loader, device, svg_nt, tvg_nt, is_cuda=False, use_amp=False):
     model.eval()
     y_true, y_prob = [], []
     with torch.no_grad():
+        if scenario == "F":
+            for merged_batch, labels, _ in loader:
+                merged_batch = merged_batch.to(device, non_blocking=is_cuda)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    logits = run_forward_unified(model, merged_batch, models.UNIFIED_NODE_TYPES)
+                y_prob.extend(torch.sigmoid(logits).float().cpu().tolist())
+                y_true.extend(labels.tolist())
+            return y_true, y_prob
+
         for svg_batch, tvg_batch, labels, _ in loader:
             svg_batch = svg_batch.to(device, non_blocking=is_cuda)
             tvg_batch = tvg_batch.to(device, non_blocking=is_cuda)
@@ -123,10 +146,16 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     # verified to work in this environment.
     num_workers = config.get("num_workers", 0)
 
+    # Scenario F uses its own collate_fn (merges svg+tvg into one graph
+    # PER ITEM before batching -- see collate_pairs_unified's docstring
+    # for why merge-then-batch beats batch-then-merge). Every other
+    # scenario keeps the original two-graph collation unchanged.
+    collate_fn = ds.collate_pairs_unified if scenario == "F" else ds.collate_pairs
+
     def _loader(items, shuffle):
         return DataLoader(
             [(s, t, l, p) for s, t, l, p in items], batch_size=config["batch_size"],
-            shuffle=shuffle, collate_fn=ds.collate_pairs,
+            shuffle=shuffle, collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=is_cuda,
             persistent_workers=(num_workers > 0),
@@ -160,21 +189,34 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     for epoch in range(config["epoch_cap"]):
         model.train()
         epoch_loss, n_batches = 0.0, 0
-        for svg_batch, tvg_batch, labels, _ in train_loader:
-            # non_blocking only actually overlaps with compute when paired
-            # with pin_memory=True on the loader (set above) -- otherwise
-            # it's a no-op fallback to a normal blocking copy.
-            svg_batch = svg_batch.to(device, non_blocking=is_cuda)
-            tvg_batch = tvg_batch.to(device, non_blocking=is_cuda)
-            labels = labels.to(device, non_blocking=is_cuda)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                logits = run_forward(model, scenario, svg_batch, tvg_batch, svg_nt, tvg_nt)
-                loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            n_batches += 1
+        if scenario == "F":
+            for merged_batch, labels, _ in train_loader:
+                merged_batch = merged_batch.to(device, non_blocking=is_cuda)
+                labels = labels.to(device, non_blocking=is_cuda)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    logits = run_forward_unified(model, merged_batch, models.UNIFIED_NODE_TYPES)
+                    loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+        else:
+            for svg_batch, tvg_batch, labels, _ in train_loader:
+                # non_blocking only actually overlaps with compute when paired
+                # with pin_memory=True on the loader (set above) -- otherwise
+                # it's a no-op fallback to a normal blocking copy.
+                svg_batch = svg_batch.to(device, non_blocking=is_cuda)
+                tvg_batch = tvg_batch.to(device, non_blocking=is_cuda)
+                labels = labels.to(device, non_blocking=is_cuda)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    logits = run_forward(model, scenario, svg_batch, tvg_batch, svg_nt, tvg_nt)
+                    loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
         train_loss = epoch_loss / max(n_batches, 1)
 
         val_true, val_prob = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
@@ -497,6 +539,76 @@ def _stratified_split(df, label_col, val_frac, test_frac, seed, target_pos_frac=
     return train_df, val_df, test_df
 
 
+def _stratified_split_by_city(df, label_col, city_col, val_frac, test_frac, seed, target_pos_frac=None):
+    """Like _stratified_split, but stratifies JOINTLY by (label_col x
+    city_col) instead of label_col alone -- every split preserves BOTH
+    the global positive/negative ratio AND each city's share of the
+    dataset, rather than only one of the two. Needed once the dataset is
+    pooled across cities (see 05b_dataset_assembly_pooled.ipynb): without
+    this, a plain label-only stratified split could, by chance, put
+    proportionally more Bogor points in train and more Warsaw points in
+    test (or vice versa) even while getting the positive rate right --
+    which would confound "does the model generalize" with "did this
+    split happen to be city-imbalanced."
+
+    Splits each (label, city) cell separately by the same val_frac/
+    test_frac percentages, then concatenates all cells -- so every
+    split's label rate AND city proportions match the source data by
+    construction. target_pos_frac upsampling (see _stratified_split's
+    docstring) is applied per CITY within each split, so a target
+    positive rate is met within each city's rows, not just globally
+    across the pooled split -- keeping the upsampling from silently
+    shifting the split's city balance as a side effect of fixing its
+    label balance.
+
+    Falls back to plain _stratified_split's behavior (single group =
+    label only) if city_col isn't present in df -- callers can pass this
+    unconditionally without checking the column exists first."""
+    if city_col not in df.columns:
+        return _stratified_split(df, label_col, val_frac, test_frac, seed, target_pos_frac)
+
+    rng = np.random.default_rng(seed)
+    cities = sorted(df[city_col].unique())
+
+    def _split_cell(cell_df, cell_seed):
+        shuffled = cell_df.sample(frac=1.0, random_state=cell_seed)
+        n = len(shuffled)
+        n_val = int(round(n * val_frac))
+        n_test = int(round(n * test_frac))
+        return shuffled.iloc[:n_val], shuffled.iloc[n_val:n_val + n_test], shuffled.iloc[n_val + n_test:]
+
+    def _maybe_upsample(pos_part, neg_part):
+        if target_pos_frac is None or len(pos_part) == 0:
+            return pos_part
+        n_neg = len(neg_part)
+        target_n_pos = int(round((target_pos_frac * n_neg) / max(1 - target_pos_frac, 1e-6)))
+        if target_n_pos <= len(pos_part):
+            return pos_part
+        extra_idx = rng.choice(pos_part.index, size=target_n_pos - len(pos_part), replace=True)
+        return pd.concat([pos_part, pos_part.loc[extra_idx]])
+
+    val_parts, test_parts, train_parts = [], [], []
+    for city in cities:
+        city_df = df[df[city_col] == city]
+        pos_df = city_df[city_df[label_col] == 1]
+        neg_df = city_df[city_df[label_col] == 0]
+
+        # cell_seed varies by city so cities don't all draw the identical
+        # shuffle ordering, while still being fully determined by `seed`
+        # (reproducible across repeats given the same seed).
+        pos_val, pos_test, pos_train = _split_cell(pos_df, seed + hash(city) % 10_000)
+        neg_val, neg_test, neg_train = _split_cell(neg_df, seed + hash(city) % 10_000)
+
+        val_parts.append(pd.concat([_maybe_upsample(pos_val, neg_val), neg_val]))
+        test_parts.append(pd.concat([_maybe_upsample(pos_test, neg_test), neg_test]))
+        train_parts.append(pd.concat([_maybe_upsample(pos_train, neg_train), neg_train]))
+
+    val_df = pd.concat(val_parts).sample(frac=1.0, random_state=seed)
+    test_df = pd.concat(test_parts).sample(frac=1.0, random_state=seed + 1)
+    train_df = pd.concat(train_parts).sample(frac=1.0, random_state=seed + 2)
+    return train_df, val_df, test_df
+
+
 def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_repeats, config, svg_kwargs, tvg_kwargs,
                                  device, checkpoint_dir, verbose=True, seed=42):
     """Repeated RANDOM train/val/test re-splits -- a THIRD, separate scheme
@@ -733,6 +845,127 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
 
         results.append({"repeat": repeat, "n_train": len(train_df), "n_test": len(test_df),
                          **test_metrics})
+        results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
+
+    return results
+
+
+def run_scenario_cv_repeats(scenario, head_depth, use_ablation, dataset, n_repeats, config, svg_kwargs, tvg_kwargs,
+                             device, checkpoint_dir, verbose=True, seed=42):
+    """Repeated fixed-COMPOSITION cross-validation -- a FIFTH scheme,
+    distinct from all four above (run_scenario / run_scenario_bootstrap /
+    run_scenario_random_repeats / run_scenario_train_test_repeats). Used
+    by 07e_train_eval_cv_scheme.ipynb for the A-G (including F) scheme
+    comparison across the pooled Bogor+Warsaw dataset.
+
+    WHAT "fixed composition, moving along the repeat" MEANS, EXACTLY:
+    every repeat uses the SAME split percentages (config["val_frac"] /
+    config["test_frac"], default 15/20 -> 65/15/20 train/val/test) and
+    the SAME stratification scheme (joint label x city, via
+    _stratified_split_by_city) -- so every repeat's train/val/test are
+    like-for-like in KIND: same size ratios, same label balance, same
+    per-city proportions, every time. What changes each repeat is WHICH
+    specific points land in which split -- a fresh stratified draw per
+    repeat_seed, same as run_scenario_random_repeats. This is NOT k-fold
+    (no folds, no guarantee every point appears in test exactly once
+    across repeats) and NOT bootstrap (no resampling with replacement,
+    no dedup, every point used exactly once WITHIN a given repeat). It's
+    closest in spirit to run_scenario_random_repeats, with two
+    deliberate differences for this comparison:
+      1. Stratified by (label x city) jointly, not label alone -- see
+         _stratified_split_by_city's docstring for why that matters once
+         the dataset pools two cities.
+      2. Every scenario A-G (including F) in a given run of this
+         function, AT THE SAME repeat index, gets the IDENTICAL split --
+         guaranteed by using the same repeat_seed (seed + repeat) as the
+         sole source of randomness per repeat, same contract as
+         run_scenario_random_repeats already has for A-E/G. This makes
+         scenario comparisons AT a given repeat directly comparable
+         (same train/val/test rows), not just comparable in aggregate.
+
+    config["city_col"] (default "city") names the column used for the
+    city half of the joint stratification -- see graph_datasets.
+    DualGraphDataset / 05b_dataset_assembly_pooled.ipynb's dataset_index
+    for where that column comes from. Falls back to label-only
+    stratification if the column isn't present (see
+    _stratified_split_by_city's own fallback).
+
+    Same checkpoint/resume-on-reconnect contract as the other four
+    schemes. Descriptive aggregates only (mean +/- std across repeats) --
+    like bootstrap/random-repeats/70-30, this doesn't feed evaluate.py's
+    paired k-fold significance tests (see run_scenario's docstring for
+    why those tests don't apply outside formal k-fold)."""
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"{scenario}_{head_depth}{'_ablation' if use_ablation else ''}"
+    results_path = checkpoint_dir / f"{tag}_results.json"
+    history_dir = checkpoint_dir / f"{tag}_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    results = json.loads(results_path.read_text()) if results_path.exists() else []
+    done_repeats = {r["repeat"] for r in results}
+
+    best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
+    best_so_far = (json.loads(best_model_meta_path.read_text())
+                   if best_model_meta_path.exists() else None)
+
+    index_df = dataset.index_df
+    val_frac = config.get("val_frac", 0.15)
+    test_frac = config.get("test_frac", 0.20)
+    label_col = config.get("label_col", "label")
+    city_col = config.get("city_col", "city")
+    target_pos_frac = config.get("target_pos_frac", None)
+
+    for repeat in range(n_repeats):
+        if repeat in done_repeats:
+            continue
+
+        repeat_seed = seed + repeat
+        train_df, val_df, test_df = _stratified_split_by_city(
+            index_df, label_col, city_col, val_frac, test_frac, repeat_seed, target_pos_frac)
+
+        n = len(train_df) + len(val_df) + len(test_df)
+
+        def _items(df):
+            return [dataset[i] for i in df.index]
+
+        if verbose:
+            has_city = city_col in index_df.columns
+            pos_rates = (f", pos_rate train/val/test="
+                         f"{train_df[label_col].mean():.3f}/{val_df[label_col].mean():.3f}/{test_df[label_col].mean():.3f}")
+            city_note = ""
+            if has_city:
+                city_counts = {
+                    split_name: split_df[city_col].value_counts().to_dict()
+                    for split_name, split_df in [("train", train_df), ("val", val_df), ("test", test_df)]
+                }
+                city_note = f", per-city n={city_counts}"
+            print(f"  -- repeat {repeat} (fixed-composition CV, stratified by "
+                  f"'{label_col}'x'{city_col}', n={n}, n_train={len(train_df)}, "
+                  f"n_val={len(val_df)}, n_test={len(test_df)}{pos_rates}{city_note}) --")
+
+        repeat_history_path = history_dir / f"repeat{repeat}.json"
+        test_metrics, best_state = train_one_fold(
+            scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
+            svg_kwargs, tvg_kwargs, config, device,
+            verbose=verbose, history_path=repeat_history_path,
+        )
+
+        if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
+            torch.save(best_state, best_model_path)
+            best_so_far = {"repeat": repeat,
+                            "val_pr_auc": test_metrics["val_pr_auc"],
+                            "test_pr_auc": test_metrics["pr_auc"],
+                            "test_auroc": test_metrics.get("auroc")}
+            best_model_meta_path.write_text(json.dumps(_to_jsonable(best_so_far), indent=1))
+            if verbose:
+                print(f"    -> new best model for {tag} "
+                      f"(val pr_auc={test_metrics['val_pr_auc']:.4f}, "
+                      f"test pr_auc={test_metrics['pr_auc']:.4f}), saved.")
+
+        results.append({"repeat": repeat, "n_train": len(train_df), "n_val": len(val_df),
+                         "n_test": len(test_df), **test_metrics})
         results_path.write_text(json.dumps(_to_jsonable(results), indent=1))
 
     return results

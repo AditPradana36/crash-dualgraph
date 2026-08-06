@@ -1,0 +1,53 @@
+# Eval config for the fixed-composition CV-by-repeat branch
+# (07e_train_eval_cv_scheme.ipynb). Separate from eval.yaml (07, k-fold),
+# eval_bootstrap.yaml (07b), eval_random_repeats.yaml (07c), and
+# eval_70_30.yaml (07d).
+#
+# 65/15/20 train/val/test (val_frac=0.15, test_frac=0.20, remaining 0.65
+# is train) -- distinct from 07c's 60/20/20 and 07d's 70/30 (no val).
+#
+# Stratification: JOINT (label x city), via train._stratified_split_by_city
+# -- not label alone. Requires config["city_col"] (default "city") to
+# exist on dataset.index_df (see 05b_dataset_assembly_pooled.ipynb's
+# dataset_index.parquet); falls back to label-only stratification if
+# absent, so this config is still safe to use against a single-city index.
+n_repeats: 5
+val_frac: 0.15
+test_frac: 0.20
+
+label_col: label
+city_col: city
+target_pos_frac: null
+
+# Warm-up + early stopping -- same defaults as 07c.
+warmup_epochs: 100
+epoch_cap: 400
+patience: 40
+lr_patience: 10
+
+# Threshold: FIXED at 0.5 (the plain hardcoded-0.5 behavior) -- NOT
+# adaptive, unlike 07c's cost-sensitive default. threshold_fn_cost/
+# threshold_fp_cost below are unused under "fixed" but kept present so
+# switching to an adaptive method later is a one-line config change.
+threshold_method: fixed
+threshold_fn_cost: 10.0
+threshold_fp_cost: 1.0
+
+batch_size: 128
+lr: 0.005
+weight_decay: 0.0003
+num_workers: 0
+use_amp: true
+metrics_descriptive_only:
+- pr_auc
+- auroc
+- f1
+- precision
+- recall
+- accuracy
+- bce_loss
+- threshold_used
+- threshold_method
+interpretability_methods:
+- attention_weights
+- gnnexplainer

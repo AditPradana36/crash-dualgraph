@@ -1,0 +1,39 @@
+# Model config for the fixed-composition CV-by-repeat branch
+# (07e_train_eval_cv_scheme.ipynb). Separate from model.yaml (07),
+# model_bootstrap.yaml (07b), model_random_repeats.yaml (07c), and
+# model_70_30.yaml (07d).
+#
+# Same capacity/regularization as model_random_repeats.yaml -- architecture
+# held constant so this branch's differences vs. 07c are attributable to
+# the split scheme (fixed composition, joint label x city stratification,
+# 65/15/20) and NOT to a confounding architecture change.
+#
+# HEAD DEPTH: unlike every other 07 branch, this one does NOT sweep
+# linear vs mlp2 -- head_depth is FIXED at "mlp2" for every scenario
+# (A-G). See 07e's own notebook intro for why: head-depth comparison is
+# treated as already settled by the earlier branches, and this run's
+# purpose is the scheme/city comparison, not re-opening the depth
+# question. The notebook reads this value directly rather than looping
+# over HEAD_DEPTHS like 07/07b/07c/07d do.
+head_depth: mlp2
+
+hidden_dim: 128
+fusion_dim: 128
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.45
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+- G
+ablation_scope:
+- B
+- C
+- D
+- E
+- F

@@ -42,3 +42,24 @@ def build_feature_table(point_ids, svg_dir, tvg_dir, torch_module):
         row["point_id"] = pid
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def build_feature_table_pooled(index_df, torch_module):
+    """Like build_feature_table, but reads svg_dir/tvg_dir PER ROW from
+    index_df (columns added by 05b_dataset_assembly_pooled.ipynb) instead
+    of one shared dir -- same reason as graph_datasets.PooledDualGraphDataset:
+    Bogor and Warsaw's graphs live in different folders. Keys the
+    returned table by 'uid' (e.g. bog_positive_12, war_negative_34 --
+    city AND label encoded, see 05b), not bare point_id, matching
+    PooledDualGraphDataset's convention -- callers merge back onto
+    index_df via 'uid', not 'point_id'."""
+    from pathlib import Path
+    import pandas as pd
+    rows = []
+    for _, r in index_df.iterrows():
+        svg_data = torch_module.load(Path(r["svg_dir"]) / f"{r['point_id']}.pt", weights_only=False)
+        tvg_data = torch_module.load(Path(r["tvg_dir"]) / f"{r['point_id']}.pt", weights_only=False)
+        row = flatten_pair(svg_data, tvg_data)
+        row["uid"] = r["uid"]
+        rows.append(row)
+    return pd.DataFrame(rows)

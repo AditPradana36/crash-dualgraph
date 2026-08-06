@@ -16,6 +16,8 @@ from pathlib import Path
 import torch
 from torch_geometric.data import Batch
 
+import unified_graph as ug
+
 
 class DualGraphDataset:
     def __init__(self, index_df, svg_dir, tvg_dir):
@@ -35,11 +37,59 @@ class DualGraphDataset:
         return svg_data, tvg_data, label, pid
 
 
+class PooledDualGraphDataset:
+    """Like DualGraphDataset, but reads svg_dir/tvg_dir PER ROW from the
+    index (columns added by 05b_dataset_assembly_pooled.ipynb) instead of
+    one shared dir for the whole dataset -- needed because Bogor and
+    Warsaw's graphs live in different folders (different Drive paths per
+    city), so there's no single svg_dir/tvg_dir that covers every row.
+
+    point_id is only unique WITHIN a city (see 05b's own uid-collision
+    discussion) -- __getitem__ uses point_id as the on-disk filename
+    (matching what 04/05 actually wrote), and 'uid' (e.g. bog_positive_12,
+    war_negative_34 -- city AND label encoded, see 05b) as the label
+    carried alongside every item instead, so nothing downstream ever
+    needs to resolve a bare point_id back to a city itself."""
+    def __init__(self, index_df):
+        self.index_df = index_df.reset_index(drop=True)
+
+    def __len__(self):
+        return len(self.index_df)
+
+    def __getitem__(self, i):
+        row = self.index_df.iloc[i]
+        pid = row["point_id"]
+        svg_data = torch.load(Path(row["svg_dir"]) / f"{pid}.pt", weights_only=False)
+        tvg_data = torch.load(Path(row["tvg_dir"]) / f"{pid}.pt", weights_only=False)
+        label = torch.tensor(float(row["label"]))
+        # uid (e.g. bog_positive_12, war_negative_34 -- city AND label
+        # encoded, see 05b) returned as the item's id rather than the
+        # raw point_id, since point_id alone isn't globally unique
+        # across pooled cities -- see 05b's uid discussion.
+        return svg_data, tvg_data, label, row["uid"]
+
+
 def collate_pairs(batch):
     svg_list, tvg_list, labels, pids = zip(*batch)
     svg_batch = Batch.from_data_list(list(svg_list))
     tvg_batch = Batch.from_data_list(list(tvg_list))
     return svg_batch, tvg_batch, torch.stack(labels), list(pids)
+
+
+def collate_pairs_unified(batch):
+    """Scenario F's collate_fn. Merges each item's (svg, tvg) pair into
+    ONE HeteroData via unified_graph.merge_svg_tvg BEFORE batching —
+    cheaper and simpler than batching svg/tvg separately (as
+    collate_pairs does) and merging after, since PyG's Batch.from_data_list
+    already knows how to offset edge_index correctly across heterogeneous
+    node types as long as it's handed already-merged single graphs. Each
+    item is normalized (via apply_normalization on the original svg/tvg
+    pair, upstream in train.py) BEFORE this runs, same as the two-graph
+    path — merging happens last, right before batching."""
+    svg_list, tvg_list, labels, pids = zip(*batch)
+    merged_list = [ug.merge_svg_tvg(s, t) for s, t in zip(svg_list, tvg_list)]
+    merged_batch = Batch.from_data_list(merged_list)
+    return merged_batch, torch.stack(labels), list(pids)
 
 
 # Explicit, not auto-detected — avoids ever accidentally normalizing a
