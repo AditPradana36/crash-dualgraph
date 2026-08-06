@@ -8,14 +8,11 @@
 # the split scheme (fixed composition, joint label x city stratification,
 # 65/15/20) and NOT to a confounding architecture change.
 #
-# HEAD DEPTH: unlike every other 07 branch, this one does NOT sweep
-# linear vs mlp2 -- head_depth is FIXED at "mlp2" for every scenario
-# (A-G). See 07e's own notebook intro for why: head-depth comparison is
-# treated as already settled by the earlier branches, and this run's
-# purpose is the scheme/city comparison, not re-opening the depth
-# question. The notebook reads this value directly rather than looping
-# over HEAD_DEPTHS like 07/07b/07c/07d do.
-head_depth: mlp2
+# HEAD DEPTH: swept in-notebook (HEAD_DEPTHS = ["linear", "mlp2"]),
+# same convention 07c already uses -- not read from this file. This
+# branch originally fixed head_depth at "mlp2" only, treating the
+# depth question as already settled by the earlier branches, but that
+# was reopened since mlp2-only results looked unsatisfying.
 
 hidden_dim: 128
 fusion_dim: 128
