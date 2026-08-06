@@ -9,6 +9,7 @@ once, catching both missing files AND corrupted/truncated ones (e.g. from
 a Colab session killed mid-torch.save), while simultaneously accumulating
 type-presence stats — no second pass needed just for the audit.
 """
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -100,4 +101,45 @@ def fold_balance_report(df, fold_cols):
     return {
         col: df.groupby(col)["label"].agg(["count", "sum"]).rename(columns={"sum": "n_positive"})
         for col in fold_cols
+    }
+
+
+def load_unified_vocab_sizes(city_cache_dirs):
+    """Reads highway_vocab.json / building_type_vocab.json from every
+    city's osm_cache dir and asserts they're all identical -- the
+    post-04b_vocab_unification.ipynb invariant every pooled/cross-city
+    notebook (05b, 07e, 07f, graph_inspection) relies on. A mismatch
+    here means at least one city's cache still holds a pre-unification
+    (or otherwise stale) vocab, which would silently misalign a shared
+    embedding table if pooling went ahead anyway.
+
+    city_cache_dirs: {city_name: path to that city's <base_dir>/interim/osm_cache}
+
+    Returns {"highway_vocab": {...}, "building_type_vocab": {...},
+             "highway_vocab_size": int, "building_type_vocab_size": int}
+    -- the agreed-upon vocabs themselves plus their sizes.
+    """
+    highway_vocabs, building_vocabs = {}, {}
+    for city, cache_dir in city_cache_dirs.items():
+        cache_dir = Path(cache_dir)
+        with open(cache_dir / "highway_vocab.json") as f:
+            highway_vocabs[city] = json.load(f)
+        with open(cache_dir / "building_type_vocab.json") as f:
+            building_vocabs[city] = json.load(f)
+
+    cities = list(city_cache_dirs)
+    ref_city = cities[0]
+    for city in cities[1:]:
+        assert highway_vocabs[city] == highway_vocabs[ref_city], (
+            f"highway_vocab mismatch between '{ref_city}' and '{city}' -- "
+            "run 04b_vocab_unification.ipynb before pooling these cities.")
+        assert building_vocabs[city] == building_vocabs[ref_city], (
+            f"building_type_vocab mismatch between '{ref_city}' and '{city}' -- "
+            "run 04b_vocab_unification.ipynb before pooling these cities.")
+
+    return {
+        "highway_vocab": highway_vocabs[ref_city],
+        "building_type_vocab": building_vocabs[ref_city],
+        "highway_vocab_size": len(highway_vocabs[ref_city]),
+        "building_type_vocab_size": len(building_vocabs[ref_city]),
     }
