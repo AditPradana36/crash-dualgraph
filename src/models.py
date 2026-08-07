@@ -10,7 +10,27 @@ own QC cell (one forward pass against a real graph pair from 05).
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import HeteroConv, GATv2Conv, global_mean_pool
+from torch_geometric.nn import HeteroConv, GATv2Conv, GINEConv, global_mean_pool
+
+
+def _make_conv(conv_type, hidden_dim, heads, edge_dim, add_self_loops):
+    """One relation's message-passing operator, built per `conv_type` --
+    the only thing that differs between the default GATv2 encoders and
+    the GIN(E) comparison branch (07h). GATv2Conv learns per-neighbor
+    attention weights; GINEConv sums neighbor messages (edge features
+    linearly folded in when edge_dim is given) through a small MLP --
+    theoretically the most WL-expressive standard MPNN, but with no
+    learned per-neighbor weighting and no attention-weight
+    interpretability. GINEConv has no add_self_loops concept (self
+    information already enters via its own (1+eps)*x term), so that
+    argument is simply unused on that branch."""
+    if conv_type == "gatv2":
+        return GATv2Conv(hidden_dim, hidden_dim // heads, heads=heads, concat=True,
+                          edge_dim=edge_dim, add_self_loops=add_self_loops)
+    if conv_type == "gine":
+        mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
+        return GINEConv(mlp, edge_dim=edge_dim, train_eps=True)
+    raise ValueError(f"Unknown conv_type: {conv_type!r} (expected 'gatv2' or 'gine')")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -124,7 +144,8 @@ SVG_EDGE_DIM = {"sees": 2, "mounted_with": 1, "near": 1}
 
 class SVGEncoder(nn.Module):
     def __init__(self, hidden_dim=64, heads=4, num_layers=2, dropout=0.35,
-                 signage_vocab=5, light_pole_vocab=4, road_marking_vocab=2, cat_embed_dim=2):
+                 signage_vocab=5, light_pole_vocab=4, road_marking_vocab=2, cat_embed_dim=2,
+                 conv_type="gatv2"):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -146,9 +167,8 @@ class SVGEncoder(nn.Module):
         for _ in range(num_layers):
             conv_dict = {}
             for (src, rel, dst) in SVG_EDGE_TYPES:
-                conv_dict[(src, rel, dst)] = GATv2Conv(
-                    hidden_dim, hidden_dim // heads, heads=heads, concat=True,
-                    edge_dim=SVG_EDGE_DIM[rel], add_self_loops=(src == dst),
+                conv_dict[(src, rel, dst)] = _make_conv(
+                    conv_type, hidden_dim, heads, SVG_EDGE_DIM[rel], add_self_loops=(src == dst),
                 )
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
             self.norms.append(nn.ModuleDict({nt: nn.LayerNorm(hidden_dim) for nt in SVG_NODE_TYPES}))
@@ -213,7 +233,8 @@ class TVGEncoder(nn.Module):
     def __init__(self, hidden_dim=64, heads=4, num_layers=2, dropout=0.35,
                  building_type_vocab=58, highway_vocab=13,
                  building_type_embed_dim=8, highway_embed_dim=4,
-                 continuous_missing_dim=4, use_ablation_edges=False):
+                 continuous_missing_dim=4, use_ablation_edges=False,
+                 conv_type="gatv2"):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_ablation_edges = use_ablation_edges
@@ -254,9 +275,8 @@ class TVGEncoder(nn.Module):
         for _ in range(num_layers):
             conv_dict = {}
             for (src, rel, dst) in edge_types:
-                conv_dict[(src, rel, dst)] = GATv2Conv(
-                    hidden_dim, hidden_dim // heads, heads=heads, concat=True,
-                    edge_dim=edge_dim_for[(src, rel, dst)], add_self_loops=(src == dst),
+                conv_dict[(src, rel, dst)] = _make_conv(
+                    conv_type, hidden_dim, heads, edge_dim_for[(src, rel, dst)], add_self_loops=(src == dst),
                 )
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
             node_types = TVG_NODE_TYPES if use_ablation_edges else \
@@ -467,10 +487,12 @@ class UnifiedEncoder(nn.Module):
                  signage_vocab=5, light_pole_vocab=4, road_marking_vocab=2, cat_embed_dim=2,
                  building_type_vocab=58, highway_vocab=13,
                  building_type_embed_dim=8, highway_embed_dim=4,
-                 continuous_missing_dim=4, use_ablation_edges=False):
+                 continuous_missing_dim=4, use_ablation_edges=False,
+                 conv_type="gatv2"):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_ablation_edges = use_ablation_edges
+        self.conv_type = conv_type
 
         # SVG-side embedders/projections — same shapes as SVGEncoder, own
         # weights (never shared with a standalone SVGEncoder instance).
@@ -511,7 +533,14 @@ class UnifiedEncoder(nn.Module):
             else:
                 edge_dim_for[key] = TVG_RAW_EDGE_DIM[rel]
         for key in SAME_LOCATION_EDGE_TYPES:
-            edge_dim_for[key] = None  # no edge_attr — see unified_graph.py docstring
+            # GATv2Conv: edge_dim=None -> called with no edge_attr at all (see
+            # unified_graph.py docstring, same_location carries no real signal
+            # beyond its own existence). GINEConv can't run edge-attr-free
+            # (its message() unconditionally indexes edge_attr), so it gets a
+            # constant width-1 placeholder instead — same role "adjacent"'s
+            # constant flag already plays elsewhere in this codebase — wired
+            # up in assemble_edge_attrs below.
+            edge_dim_for[key] = 1 if conv_type == "gine" else None
 
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -522,10 +551,7 @@ class UnifiedEncoder(nn.Module):
             for key in edge_types:
                 src, rel, dst = key
                 edim = edge_dim_for[key]
-                conv_dict[key] = GATv2Conv(
-                    hidden_dim, hidden_dim // heads, heads=heads, concat=True,
-                    edge_dim=edim, add_self_loops=(src == dst),
-                )
+                conv_dict[key] = _make_conv(conv_type, hidden_dim, heads, edim, add_self_loops=(src == dst))
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
             self.norms.append(nn.ModuleDict({nt: nn.LayerNorm(hidden_dim) for nt in node_types}))
         self.dropout = dropout
@@ -569,7 +595,10 @@ class UnifiedEncoder(nn.Module):
         edge_attr_dict = {}
         for key in self._edge_types:
             if key in SAME_LOCATION_EDGE_TYPES:
-                continue  # no edge_dim -> GATv2Conv called without edge_attr for this key
+                if self.conv_type == "gine":
+                    n_edges = data[key].edge_index.shape[1]
+                    edge_attr_dict[key] = torch.ones((n_edges, 1), device=data[key].edge_index.device)
+                continue  # GATv2Conv: no edge_dim -> called without edge_attr for this key
             src, rel, dst = key
             raw = data[key].edge_attr
             if rel in ("connects", "on_segment"):

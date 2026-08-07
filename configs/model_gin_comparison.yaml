@@ -1,0 +1,43 @@
+# Model config for the GIN(E) vs GATv2 comparison experiment
+# (07h_train_eval_gin.ipynb). Byte-identical to model_capacity_revision.yaml
+# (07g) except for the one new key, conv_type -- deliberately, so encoder
+# choice is the ONLY variable in this comparison, not conflated with
+# another capacity change. (07h reuses eval_capacity_revision.yaml
+# UNCHANGED too, for the same reason -- see 07h's own notebook intro.)
+#
+# conv_type: gine -- swaps every GATv2Conv in SVGEncoder/TVGEncoder/
+# UnifiedEncoder for GINEConv (src/models.py's _make_conv). GIN(E) sums
+# neighbor messages (+ linearly-folded-in edge features) through a small
+# MLP, rather than learning per-neighbor attention weights -- provably
+# the most WL-expressive standard message-passing scheme, but with no
+# learned attention (and so no attention-weight interpretability --
+# GNNExplainer still applies). heads/attention-head-splitting is unused
+# on this path; kept in the config only because svg_kwargs/tvg_kwargs
+# still accept it (harmlessly ignored by _make_conv's gine branch).
+hidden_dim: 128
+fusion_dim: 256
+head_hidden: 256
+head_dropout: 0.3
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.3
+cat_embed_dim: 4
+building_type_embed_dim: 16
+highway_embed_dim: 8
+head_depth: mlp2
+conv_type: gine
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+- G
+ablation_scope:
+- B
+- C
+- D
+- E
+- F
