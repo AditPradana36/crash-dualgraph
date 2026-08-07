@@ -73,21 +73,31 @@ def process_incident(
     node_local_idx = {nid: i for i, nid in enumerate(included_intersections)}
 
     # ── Peer incidents: same-city, same-fold, POSITIVE-labeled only, within threshold ──
-    # same-city added for the multi-city pipeline: fold_rep{r} values are
-    # cluster ids (0..k-1) assigned INDEPENDENTLY per city (see
-    # 01_data_prep_sampling.ipynb), not globally unique -- without this,
-    # a Bogor point and a Somerville point sharing the same fold NUMBER
-    # would be treated as spatial peers despite being on different
-    # continents. Only applied if a 'city' column is present, so this
-    # stays a no-op for any single-city reconciled_df.
-    fold_col = [c for c in reconciled_df.columns if c.startswith("fold_rep")][0]
-    same_fold = reconciled_df[
-        (reconciled_df[fold_col] == incident_row[fold_col])
-        & (reconciled_df["point_id"] != incident_row["point_id"])
-        & (reconciled_df["label"] == 1)  # HARD RULE: peers are never negative points
-    ]
-    if "city" in reconciled_df.columns:
-        same_fold = same_fold[same_fold["city"] == incident_row["city"]]
+    # 01_data_prep_sampling.ipynb no longer assigns fold_rep{r} columns
+    # (CV folds are no longer applied at 01) -- crash_history is
+    # ablation-only and never used by the default (non-ablation)
+    # scenarios, so rather than guessing a replacement containment
+    # scheme, peers are simply empty whenever no fold_rep column exists.
+    # If fold_rep{r} columns DO exist (e.g. a reconciled_df from an older
+    # run, or a future notebook that reassigns them), same-fold matching
+    # is used exactly as before, still narrowed to same-city first --
+    # fold_rep{r} values are per-city cluster ids (0..k-1), not globally
+    # unique, so without the city check a Bogor point and a Somerville
+    # point sharing the same fold NUMBER could be treated as spatial
+    # peers despite being on different continents.
+    fold_cols = [c for c in reconciled_df.columns if c.startswith("fold_rep")]
+    if fold_cols:
+        fold_col = fold_cols[0]
+        same_fold = reconciled_df[
+            (reconciled_df[fold_col] == incident_row[fold_col])
+            & (reconciled_df["point_id"] != incident_row["point_id"])
+            & (reconciled_df["label"] == 1)  # HARD RULE: peers are never negative points
+        ]
+        if "city" in reconciled_df.columns:
+            same_fold = same_fold[same_fold["city"] == incident_row["city"]]
+    else:
+        same_fold = reconciled_df.iloc[0:0]  # no fold structure -- no peers, see above
+
     if len(same_fold):
         dists = np.hypot(same_fold["_utm_x"] - origin_xy[0], same_fold["_utm_y"] - origin_xy[1])
         peers = same_fold[dists.values <= crash_history_threshold_m]
