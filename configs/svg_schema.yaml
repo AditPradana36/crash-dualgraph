@@ -46,9 +46,12 @@ mask_min_area_fraction: 0.0008          # default, used for signage/light_pole/r
 mask_min_area_fraction_by_type:
   building: 0.05     # tune these based on visual inspection
   vegetation: 0.05
-# NEW parameter, surfaced while building 03 — was never explicitly set before.
-# Recommended starting value: deliberately much smaller than near_cutoff_d,
-# since this is meant to indicate "physically co-located on the same support"
-# (e.g. a sign and light on the same pole), not general proximity.
-# PROVISIONAL — please confirm or override, same as the three above.
+# REVISED: mounted_with is now triggered by centroid distance ALONE --
+# bbox overlap is no longer required (a sign and a light mounted on the
+# same pole rarely have overlapping boxes at all; requiring it excluded
+# exactly the co-located-but-non-overlapping pairs this relation exists
+# to capture -- see src/svg_builder.py's build_mounted_with_edges).
+# Deliberately much smaller than near_cutoff_d, since this is meant to
+# indicate "physically co-located on the same support," not general
+# proximity. PROVISIONAL — please confirm or override, same as the three above.
 mounted_with_distance_threshold: 0.04

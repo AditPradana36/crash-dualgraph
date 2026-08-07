@@ -146,8 +146,15 @@ def build_sees_edges(objects, w, h, ego_pos_frac=(0.5, 0.93)):
 
 def build_mounted_with_edges(objects, w, h, distance_threshold):
     """Signage<->Signage, Light_pole<->Light_pole, Signage<->Light_pole.
-    Triggered by bbox overlap OR centroid distance <= threshold (fraction
-    of diagonal). Edge feature: bbox overlap ratio (0.0 if distance-only)."""
+
+    REVISED: triggered by centroid distance <= threshold (fraction of
+    diagonal) ALONE -- bbox overlap is no longer required to qualify a
+    pair as "mounted" (a sign and a light on the same pole rarely have
+    overlapping boxes at all; requiring overlap was excluding exactly the
+    co-located-but-non-overlapping pairs this relation exists to capture).
+    Edge feature is still the bbox overlap ratio (0.0 for most pairs,
+    since overlap is no longer the trigger) -- kept because it's still
+    informative signal when it IS present, not because it gates anything."""
     diag = math.hypot(w, h)
     results = {}
 
@@ -159,8 +166,8 @@ def build_mounted_with_edges(objects, w, h, distance_threshold):
                 if type_a == type_b and i == j:
                     continue
                 dist = math.hypot(oa["cx_px"] - ob["cx_px"], oa["cy_px"] - ob["cy_px"]) / diag
-                overlap = _bbox_overlap_ratio(oa["bbox"], ob["bbox"])
-                if overlap > 0 or dist <= distance_threshold:
+                if dist <= distance_threshold:
+                    overlap = _bbox_overlap_ratio(oa["bbox"], ob["bbox"])
                     src.append(i); dst.append(j); attr.append(overlap)
         if src:
             return (torch.tensor([src, dst], dtype=torch.long),

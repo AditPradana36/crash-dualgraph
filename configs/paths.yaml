@@ -1,34 +1,63 @@
-cities: [bogor, warsaw]
+cities: [bogor, warsaw, krakow, somerville]
+
+base_dir: /content/drive/MyDrive/crash-dualgraph/data
 
 per_city:
   bogor:
-    base_dir: /content/drive/MyDrive/crash-dualgraph/data
-    boundary_geojson: ${base_dir}/boundary/study-area.geojson
-    positive_front_view_dir: ${base_dir}/positive/front-view
-    positive_metadata_csv: ${base_dir}/positive/panorama/metadata_outofrange_removed.csv
-    positive_points_csv: ${base_dir}/positive/points/positive_points.csv
-    negative_front_view_dir: ${base_dir}/negative/front-view
-    negative_metadata_csv: ${base_dir}/negative/panorama/metadata_outofrange_removed.csv
-    negative_points_csv: ${base_dir}/negative/points/negative_points.csv
-    interim_dir: ${base_dir}/interim
-    processed_dir: ${base_dir}/processed
-    outputs_dir: ${base_dir}/outputs
-  warsaw:
-    base_dir: /content/drive/MyDrive/crash-dualgraph/data/warsaw
-    boundary_geojson: /content/drive/MyDrive/crash-dualgraph/data/boundary/warsaw_boundary.geojson
-    positive_front_view_dir: ${base_dir}/positive/front-view
-    positive_metadata_csv: ${base_dir}/positive/panorama/metadata_outofrange_removed.csv
-    positive_points_csv: ${base_dir}/positive/points/positive_points.csv
-    negative_front_view_dir: ${base_dir}/negative/front-view
-    negative_metadata_csv: ${base_dir}/negative/panorama/metadata_outofrange_removed.csv
-    negative_points_csv: ${base_dir}/negative/points/negative_points.csv
-    interim_dir: ${base_dir}/interim
-    processed_dir: ${base_dir}/processed
-    outputs_dir: ${base_dir}/outputs
+    boundary_geojson: /content/drive/MyDrive/crash-dualgraph/data/bogor/boundary/study-area.geojson
+    positive_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/bogor/positive/front-view
+    positive_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/bogor/positive/points/metadata_outofrange_removed.csv
+    positive_points_csv: /content/drive/MyDrive/crash-dualgraph/data/bogor/positive/points/positive_points.csv
+    negative_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/bogor/negative/front-view
+    negative_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/bogor/negative/points/metadata_outofrange_removed.csv
+    negative_points_csv: /content/drive/MyDrive/crash-dualgraph/data/bogor/negative/points/negative_points.csv
 
-combined:
-  outputs_dir: /content/drive/MyDrive/crash-dualgraph/data/combined/outputs
+  warsaw:
+    boundary_geojson: /content/drive/MyDrive/crash-dualgraph/data/warsaw/boundary/study-area.geojson
+    positive_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/warsaw/positive/front-view
+    positive_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/warsaw/positive/points/metadata_outofrange_removed.csv
+    positive_points_csv: /content/drive/MyDrive/crash-dualgraph/data/warsaw/positive/points/positive_points.csv
+    negative_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/warsaw/negative/front-view
+    negative_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/warsaw/negative/points/metadata_outofrange_removed.csv
+    negative_points_csv: /content/drive/MyDrive/crash-dualgraph/data/warsaw/negative/points/negative_points.csv
+
+  krakow:
+    boundary_geojson: /content/drive/MyDrive/crash-dualgraph/data/krakow/boundary/study-area.geojson
+    positive_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/krakow/positive/front-view
+    positive_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/krakow/positive/points/metadata_outofrange_removed.csv
+    positive_points_csv: /content/drive/MyDrive/crash-dualgraph/data/krakow/positive/points/positive_points.csv
+    negative_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/krakow/negative/front-view
+    negative_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/krakow/negative/points/metadata_outofrange_removed.csv
+    negative_points_csv: /content/drive/MyDrive/crash-dualgraph/data/krakow/negative/points/negative_points.csv
+
+  somerville:
+    boundary_geojson: /content/drive/MyDrive/crash-dualgraph/data/somerville/boundary/study-area.geojson
+    positive_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/somerville/positive/front-view
+    positive_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/somerville/positive/points/metadata_outofrange_removed.csv
+    positive_points_csv: /content/drive/MyDrive/crash-dualgraph/data/somerville/positive/points/positive_points.csv
+    negative_front_view_dir: /content/drive/MyDrive/crash-dualgraph/data/somerville/negative/front-view
+    negative_metadata_csv: /content/drive/MyDrive/crash-dualgraph/data/somerville/negative/points/metadata_outofrange_removed.csv
+    negative_points_csv: /content/drive/MyDrive/crash-dualgraph/data/somerville/negative/points/negative_points.csv
+
+# city_prefix: the "bog_"/"war_"/"kra_"/"som_" codification used for every
+# point_id from 01 onward (NOT deferred to a later pooling step like the
+# old 2-city pipeline's 05b did) -- needed because interim_dir/processed_dir
+# below are now COMBINED across all four cities, not one per city, so
+# filenames must be globally unique on their own.
+city_prefix:
+  bogor: bog
+  warsaw: war
+  krakow: kra
+  somerville: som
+
+# Combined (not per-city) interim/processed roots -- sibling to base_dir,
+# i.e. /content/drive/MyDrive/crash-dualgraph/{interim,processed}. Every
+# city's 01-04 output lands in ONE shared tree, disambiguated by the
+# city-prefixed point_id/filename above rather than by directory.
+interim_dir: /content/drive/MyDrive/crash-dualgraph/interim
+processed_dir: /content/drive/MyDrive/crash-dualgraph/processed
+outputs_dir: /content/drive/MyDrive/crash-dualgraph/outputs
 
 random_seed: 42
-approx_n_positive: 1100
-approx_n_negative: 1100
+approx_n_positive: 2200
+approx_n_negative: 2200

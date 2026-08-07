@@ -3,11 +3,19 @@ crash_history_threshold_m: 100
 n_rays: 360
 bbox_padding_m: 100
 network_type: drive
-# adjacent (building-building) has NO distance/buffer parameter — its
-# trigger is "both buildings touched the isovist" (the same criterion
-# that determines Building node inclusion), i.e. a full clique among
-# whichever buildings the isovist already included. No separate cutoff
-# needed here, unlike SVG's near/mounted_with.
+# REVISED: intersection nodes are now STRICTLY isovist-covered -- the
+# nearest road edge's endpoints (u/v) are no longer force-included when
+# they fall outside the isovist (see src/tvg_builder.py's
+# process_incident). on_segment connects to whichever of u/v actually
+# qualify, so it can now carry 0, 1, or 2 edges instead of always 2.
+#
+# REVISED: adjacent (building-building) is now a k-nearest-neighbor graph
+# among included buildings (real centroid distance in meters as the edge
+# feature), NOT the old full clique among every isovist-included
+# building -- a full clique scaled quadratically and didn't distinguish
+# "next door" from "across the isovist." adjacent_k_nearest below is that
+# k; directed per building (i's k nearest -> i, not forced symmetric).
+adjacent_k_nearest: 5
 building_shape_metrics:
 - area
 - perimeter

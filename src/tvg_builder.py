@@ -4,7 +4,6 @@ osm_fetch.py's cached global layer and isovist.py's ray-casting.
 
 Node types: incident, building, intersection, peer_incident.
 """
-import itertools
 import math
 
 import numpy as np
@@ -31,7 +30,7 @@ def _safe_float(value, default=0.0):
 def process_incident(
     incident_row, reconciled_df, buildings_gdf, building_type_vocab, highway_vocab, G,
     betweenness, orientation_entropy, tree, boundaries, utm_crs,
-    isovist_radius_m, n_rays, crash_history_threshold_m,
+    isovist_radius_m, n_rays, crash_history_threshold_m, adjacent_k_nearest=5,
 ):
     """Returns (data: HeteroData, meta: dict) for one incident point.
     meta carries plotting-relevant info reused by tvg_visualize.py so
@@ -56,24 +55,39 @@ def process_incident(
     # ── Included buildings: exactly what bounded the isovist ─────────
     included_building_ids = sorted(hit_building_idx)
 
-    # ── Included intersections: inside isovist, plus u/v always exempted ──
+    # ── Included intersections: STRICTLY inside the isovist polygon ──
+    # REVISED: u/v (the nearest road edge's endpoints) are NO LONGER
+    # force-included when they fall outside the isovist. "intersection"
+    # now means exactly what it says -- a node the isovist itself can
+    # see -- matching the same inclusion rule already used for buildings,
+    # with no special exemption for the road-projection anchors. This can
+    # leave u and/or v out of the graph entirely; on_segment (below)
+    # handles that by only connecting to whichever of the two actually
+    # qualify, rather than assuming both always do.
     included_intersections = set()
     for node_id, data_n in G.nodes(data=True):
         pt = Point(data_n["x"], data_n["y"])
         if polygon.covers(pt):
             included_intersections.add(node_id)
-    included_intersections.add(u)
-    included_intersections.add(v)
     included_intersections = sorted(included_intersections)
     node_local_idx = {nid: i for i, nid in enumerate(included_intersections)}
 
-    # ── Peer incidents: same-fold, POSITIVE-labeled only, within threshold ──
+    # ── Peer incidents: same-city, same-fold, POSITIVE-labeled only, within threshold ──
+    # same-city added for the multi-city pipeline: fold_rep{r} values are
+    # cluster ids (0..k-1) assigned INDEPENDENTLY per city (see
+    # 01_data_prep_sampling.ipynb), not globally unique -- without this,
+    # a Bogor point and a Somerville point sharing the same fold NUMBER
+    # would be treated as spatial peers despite being on different
+    # continents. Only applied if a 'city' column is present, so this
+    # stays a no-op for any single-city reconciled_df.
     fold_col = [c for c in reconciled_df.columns if c.startswith("fold_rep")][0]
     same_fold = reconciled_df[
         (reconciled_df[fold_col] == incident_row[fold_col])
         & (reconciled_df["point_id"] != incident_row["point_id"])
         & (reconciled_df["label"] == 1)  # HARD RULE: peers are never negative points
     ]
+    if "city" in reconciled_df.columns:
+        same_fold = same_fold[same_fold["city"] == incident_row["city"]]
     if len(same_fold):
         dists = np.hypot(same_fold["_utm_x"] - origin_xy[0], same_fold["_utm_y"] - origin_xy[1])
         peers = same_fold[dists.values <= crash_history_threshold_m]
@@ -166,15 +180,31 @@ def process_incident(
         data["intersection", "anchors", "incident"].edge_index = torch.zeros((2, 0), dtype=torch.long)
         data["intersection", "anchors", "incident"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
 
-    # adjacent: FULL CLIQUE among included buildings (per locked redefinition —
-    # "all buildings that touched the isovist" IS the adjacency criterion)
+    # adjacent: each building <-> its adjacent_k_nearest nearest OTHER
+    # included buildings (REVISED from the old full clique among every
+    # isovist-included building). A full clique scales quadratically and
+    # treats "next door" the same as "across the isovist"; a k-NN graph
+    # keeps that distinction, and real centroid distance (meters) replaces
+    # the old constant 1.0 flag as the edge feature -- distance is exactly
+    # what defines this neighborhood now, so it's worth recording per edge
+    # rather than discarding. Directed per building (i's k nearest get an
+    # edge i->neighbor); NOT forced symmetric -- if j is also among i's k
+    # nearest and i is among j's, both directions appear naturally, but
+    # neither is added just to mirror the other.
     n_b = len(included_building_ids)
     if n_b > 1:
-        pairs = list(itertools.combinations(range(n_b), 2))
-        src = [p[0] for p in pairs] + [p[1] for p in pairs]
-        dst = [p[1] for p in pairs] + [p[0] for p in pairs]
+        centroids = [(buildings_gdf.loc[bid].geometry.centroid.x, buildings_gdf.loc[bid].geometry.centroid.y)
+                     for bid in included_building_ids]
+        src, dst, attrs = [], [], []
+        for i in range(n_b):
+            neighbor_dists = sorted(
+                ((_dist(*centroids[i], *centroids[j]), j) for j in range(n_b) if j != i),
+                key=lambda t: t[0],
+            )
+            for d, j in neighbor_dists[:adjacent_k_nearest]:
+                src.append(i); dst.append(j); attrs.append(d)
         data["building", "adjacent", "building"].edge_index = torch.tensor([src, dst], dtype=torch.long)
-        data["building", "adjacent", "building"].edge_attr = torch.ones((len(src), 1), dtype=torch.float)
+        data["building", "adjacent", "building"].edge_attr = torch.tensor(attrs, dtype=torch.float).unsqueeze(1)
     else:
         data["building", "adjacent", "building"].edge_index = torch.zeros((2, 0), dtype=torch.long)
         data["building", "adjacent", "building"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
@@ -217,10 +247,14 @@ def process_incident(
         data["building", "fronts", "intersection"].edge_index = torch.zeros((2, 0), dtype=torch.long)
         data["building", "fronts", "intersection"].edge_attr = torch.zeros((0, 1), dtype=torch.float)
 
-    # on_segment: incident <-> u, incident <-> v, bidirectional, road attrs copied
-    u_local, v_local = node_local_idx[u], node_local_idx[v]
-    dist_u = _dist(origin_xy[0], origin_xy[1], G.nodes[u]["x"], G.nodes[u]["y"])
-    dist_v = _dist(origin_xy[0], origin_xy[1], G.nodes[v]["x"], G.nodes[v]["y"])
+    # on_segment: incident <-> whichever of u/v (the nearest road edge's
+    # endpoints) actually fall inside the isovist. REVISED: u/v are no
+    # longer force-included as intersection nodes (see above), so this
+    # can now produce 0, 1, or 2 edges instead of always exactly 2 --
+    # never crashes on a missing endpoint, it just has nothing to connect
+    # to on that side. hw/maxspeed/oneway describe the road segment
+    # itself (same for both endpoints); only distance and target node
+    # differ per endpoint.
     hw = edge_data.get("highway", "unclassified")
     if isinstance(hw, list):
         hw = hw[0]
@@ -228,13 +262,26 @@ def process_incident(
     maxspeed_val, maxspeed_missing = _safe_float(edge_data.get("maxspeed"))
     oneway = 1.0 if edge_data.get("oneway") else 0.0
 
-    seg_fwd = torch.tensor([[0, 0], [u_local, v_local]], dtype=torch.long)
-    seg_attr = torch.tensor([[dist_u, float(hw_idx), maxspeed_val, maxspeed_missing, oneway],
-                              [dist_v, float(hw_idx), maxspeed_val, maxspeed_missing, oneway]], dtype=torch.float)
-    data["incident", "on_segment", "intersection"].edge_index = seg_fwd
-    data["incident", "on_segment", "intersection"].edge_attr = seg_attr
-    data["intersection", "on_segment", "incident"].edge_index = seg_fwd.flip(0)
-    data["intersection", "on_segment", "incident"].edge_attr = seg_attr
+    seg_src, seg_dst, seg_attrs = [], [], []
+    for endpoint in (u, v):
+        if endpoint in node_local_idx:
+            dist_endpoint = _dist(origin_xy[0], origin_xy[1], G.nodes[endpoint]["x"], G.nodes[endpoint]["y"])
+            seg_src.append(0)
+            seg_dst.append(node_local_idx[endpoint])
+            seg_attrs.append([dist_endpoint, float(hw_idx), maxspeed_val, maxspeed_missing, oneway])
+
+    if seg_src:
+        seg_fwd = torch.tensor([seg_src, seg_dst], dtype=torch.long)
+        seg_attr = torch.tensor(seg_attrs, dtype=torch.float)
+        data["incident", "on_segment", "intersection"].edge_index = seg_fwd
+        data["incident", "on_segment", "intersection"].edge_attr = seg_attr
+        data["intersection", "on_segment", "incident"].edge_index = seg_fwd.flip(0)
+        data["intersection", "on_segment", "incident"].edge_attr = seg_attr
+    else:
+        data["incident", "on_segment", "intersection"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["incident", "on_segment", "intersection"].edge_attr = torch.zeros((0, 5), dtype=torch.float)
+        data["intersection", "on_segment", "incident"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["intersection", "on_segment", "incident"].edge_attr = torch.zeros((0, 5), dtype=torch.float)
 
     # crash_history (ablation): incident -> each peer, distance-weighted
     if n_peers:
