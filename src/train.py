@@ -164,6 +164,7 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     train_loader, val_loader, test_loader = _loader(train_items, True), _loader(val_items, False), _loader(test_items, False)
 
     model = models.build_model(scenario, fusion_dim=config.get("fusion_dim", 128), head_depth=head_depth,
+                                head_hidden=config.get("head_hidden", 32), head_dropout=config.get("head_dropout", 0.35),
                                 use_ablation=use_ablation, svg_kwargs=svg_kwargs, tvg_kwargs=tvg_kwargs).to(device)
     optimizer = AdamW(model.parameters(), lr=config.get("lr", 5e-3), weight_decay=config.get("weight_decay", 1e-4))
     scheduler = ReduceLROnPlateau(optimizer, mode="max", patience=config.get("lr_patience", 5), factor=0.5)
@@ -229,6 +230,15 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
         history.append({"epoch": epoch, "train_loss": train_loss,
                          "val_pr_auc": val_metrics["pr_auc"], "val_auroc": val_metrics.get("auroc"),
                          "lr": optimizer.param_groups[0]["lr"], "improved": improved})
+
+        # Per-epoch progress, printed live as this cell runs (not just on
+        # improvement/early-stop) -- the full history is already recorded
+        # above regardless, this is purely so a running notebook cell shows
+        # training happening rather than going quiet for the whole fold/repeat.
+        if verbose:
+            print(f"    epoch {epoch:3d} | train_loss={train_loss:.4f} "
+                  f"| val_pr_auc={val_metrics['pr_auc']:.4f} | val_auroc={val_metrics.get('auroc', float('nan')):.4f} "
+                  f"| lr={optimizer.param_groups[0]['lr']:.2e}{'  <- best' if improved else ''}")
 
         if improved:
             best_val_prauc = val_metrics["pr_auc"]

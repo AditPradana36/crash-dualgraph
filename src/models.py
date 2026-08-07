@@ -347,11 +347,11 @@ class ClassifierHead(nn.Module):
 
 class ScenarioSingleBranch(nn.Module):
     """A (SVG only) or B (TVG only)."""
-    def __init__(self, encoder, fusion_dim, head_depth="linear"):
+    def __init__(self, encoder, fusion_dim, head_depth="linear", head_hidden=32, head_dropout=0.35):
         super().__init__()
         self.encoder = encoder
         self.proj = nn.Linear(encoder.out_dim, fusion_dim)
-        self.head = ClassifierHead(fusion_dim, depth=head_depth)
+        self.head = ClassifierHead(fusion_dim, depth=head_depth, hidden=head_hidden, dropout=head_dropout)
 
     def forward(self, data, batch_dict=None):
         emb = self.proj(self.encoder(data, batch_dict))
@@ -360,12 +360,12 @@ class ScenarioSingleBranch(nn.Module):
 
 class ScenarioConcat(nn.Module):
     """C — early/feature fusion."""
-    def __init__(self, svg_encoder, tvg_encoder, fusion_dim, head_depth="linear"):
+    def __init__(self, svg_encoder, tvg_encoder, fusion_dim, head_depth="linear", head_hidden=32, head_dropout=0.35):
         super().__init__()
         self.svg_encoder, self.tvg_encoder = svg_encoder, tvg_encoder
         self.proj_svg = nn.Linear(svg_encoder.out_dim, fusion_dim)
         self.proj_tvg = nn.Linear(tvg_encoder.out_dim, fusion_dim)
-        self.head = ClassifierHead(fusion_dim * 2, depth=head_depth)
+        self.head = ClassifierHead(fusion_dim * 2, depth=head_depth, hidden=head_hidden, dropout=head_dropout)
 
     def forward(self, svg_data, tvg_data, svg_batch=None, tvg_batch=None):
         s = self.proj_svg(self.svg_encoder(svg_data, svg_batch))
@@ -375,13 +375,13 @@ class ScenarioConcat(nn.Module):
 
 class ScenarioLateFusion(nn.Module):
     """D — separate heads, LEARNED (not fixed) combination weight."""
-    def __init__(self, svg_encoder, tvg_encoder, fusion_dim, head_depth="linear"):
+    def __init__(self, svg_encoder, tvg_encoder, fusion_dim, head_depth="linear", head_hidden=32, head_dropout=0.35):
         super().__init__()
         self.svg_encoder, self.tvg_encoder = svg_encoder, tvg_encoder
         self.proj_svg = nn.Linear(svg_encoder.out_dim, fusion_dim)
         self.proj_tvg = nn.Linear(tvg_encoder.out_dim, fusion_dim)
-        self.head_svg = ClassifierHead(fusion_dim, depth=head_depth)
-        self.head_tvg = ClassifierHead(fusion_dim, depth=head_depth)
+        self.head_svg = ClassifierHead(fusion_dim, depth=head_depth, hidden=head_hidden, dropout=head_dropout)
+        self.head_tvg = ClassifierHead(fusion_dim, depth=head_depth, hidden=head_hidden, dropout=head_dropout)
         self.combine = nn.Linear(2, 1)  # learns how much to trust each branch's logit
 
     def forward(self, svg_data, tvg_data, svg_batch=None, tvg_batch=None):
@@ -396,13 +396,14 @@ class ScenarioCrossAttention(nn.Module):
     """E — SVG and TVG embeddings as two tokens, attending to each other
     before the final decision. Most directly tests the 'double scheme'
     hypothesis: does each branch's relevance depend on the other's context."""
-    def __init__(self, svg_encoder, tvg_encoder, fusion_dim, head_depth="linear", n_heads=2):
+    def __init__(self, svg_encoder, tvg_encoder, fusion_dim, head_depth="linear", n_heads=2,
+                 head_hidden=32, head_dropout=0.35):
         super().__init__()
         self.svg_encoder, self.tvg_encoder = svg_encoder, tvg_encoder
         self.proj_svg = nn.Linear(svg_encoder.out_dim, fusion_dim)
         self.proj_tvg = nn.Linear(tvg_encoder.out_dim, fusion_dim)
         self.cross_attn = nn.MultiheadAttention(fusion_dim, n_heads, batch_first=True)
-        self.head = ClassifierHead(fusion_dim * 2, depth=head_depth)
+        self.head = ClassifierHead(fusion_dim * 2, depth=head_depth, hidden=head_hidden, dropout=head_dropout)
 
     def forward(self, svg_data, tvg_data, svg_batch=None, tvg_batch=None):
         s = self.proj_svg(self.svg_encoder(svg_data, svg_batch)).unsqueeze(1)   # (B, 1, F)
@@ -598,19 +599,19 @@ class UnifiedEncoder(nn.Module):
 class ScenarioUnifiedGraph(nn.Module):
     """F — one merged SVG+TVG graph, one encoder, one head. See
     UnifiedEncoder / unified_graph.py for the merge scheme."""
-    def __init__(self, unified_encoder, fusion_dim, head_depth="linear"):
+    def __init__(self, unified_encoder, fusion_dim, head_depth="linear", head_hidden=32, head_dropout=0.35):
         super().__init__()
         self.encoder = unified_encoder
         self.proj = nn.Linear(unified_encoder.out_dim, fusion_dim)
-        self.head = ClassifierHead(fusion_dim, depth=head_depth)
+        self.head = ClassifierHead(fusion_dim, depth=head_depth, hidden=head_hidden, dropout=head_dropout)
 
     def forward(self, data, batch_dict=None):
         emb = self.proj(self.encoder(data, batch_dict))
         return self.head(emb).squeeze(-1)
 
 
-def build_model(scenario, fusion_dim=64, head_depth="linear", use_ablation=False,
-                 svg_kwargs=None, tvg_kwargs=None):
+def build_model(scenario, fusion_dim=64, head_depth="linear", head_hidden=32, head_dropout=0.35,
+                 use_ablation=False, svg_kwargs=None, tvg_kwargs=None):
     svg_kwargs = svg_kwargs or {}
     tvg_kwargs = dict(tvg_kwargs or {})
     tvg_kwargs["use_ablation_edges"] = use_ablation
@@ -619,15 +620,16 @@ def build_model(scenario, fusion_dim=64, head_depth="linear", use_ablation=False
     tvg_enc = TVGEncoder(**tvg_kwargs) if scenario in ("B", "C", "D", "E") else None
 
     if scenario == "A":
-        return ScenarioSingleBranch(svg_enc, fusion_dim, head_depth)
+        return ScenarioSingleBranch(svg_enc, fusion_dim, head_depth, head_hidden, head_dropout)
     if scenario == "B":
-        return ScenarioSingleBranch(tvg_enc, fusion_dim, head_depth)
+        return ScenarioSingleBranch(tvg_enc, fusion_dim, head_depth, head_hidden, head_dropout)
     if scenario == "C":
-        return ScenarioConcat(svg_enc, tvg_enc, fusion_dim, head_depth)
+        return ScenarioConcat(svg_enc, tvg_enc, fusion_dim, head_depth, head_hidden, head_dropout)
     if scenario == "D":
-        return ScenarioLateFusion(svg_enc, tvg_enc, fusion_dim, head_depth)
+        return ScenarioLateFusion(svg_enc, tvg_enc, fusion_dim, head_depth, head_hidden, head_dropout)
     if scenario == "E":
-        return ScenarioCrossAttention(svg_enc, tvg_enc, fusion_dim, head_depth)
+        return ScenarioCrossAttention(svg_enc, tvg_enc, fusion_dim, head_depth,
+                                       head_hidden=head_hidden, head_dropout=head_dropout)
     if scenario == "F":
         # UnifiedEncoder takes the UNION of svg_kwargs and tvg_kwargs
         # (hidden_dim/heads/num_layers/dropout are shared param names in
@@ -638,5 +640,5 @@ def build_model(scenario, fusion_dim=64, head_depth="linear", use_ablation=False
         unified_kwargs = {**tvg_kwargs, **svg_kwargs}
         unified_kwargs["use_ablation_edges"] = use_ablation
         unified_enc = UnifiedEncoder(**unified_kwargs)
-        return ScenarioUnifiedGraph(unified_enc, fusion_dim, head_depth)
+        return ScenarioUnifiedGraph(unified_enc, fusion_dim, head_depth, head_hidden, head_dropout)
     raise ValueError(f"Unknown scenario: {scenario} (G is XGBoost — see baseline_features.py, no torch model)")

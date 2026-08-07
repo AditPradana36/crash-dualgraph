@@ -1,0 +1,56 @@
+# Model config for the capacity-revision experiment
+# (07g_train_eval_capacity_revision.ipynb). Reconsiders every dimension
+# that could be silently bottlenecking the graph representations, after
+# several earlier runs (07b/07c/07e-style larger-dropout, fusion_dim ==
+# hidden_dim configs) underperformed.
+#
+# - fusion_dim raised to hidden_dim*2 (256), so the SVG/TVG -> fusion
+#   projection is no longer a forced 2x compression of the encoder's own
+#   readout width (out_dim = hidden_dim*2, from pool+anchor concat).
+# - head_hidden raised to 256 (was hardcoded 32 in every prior run,
+#   src/models.py's ClassifierHead default) -- 32 was a far sharper
+#   bottleneck than fusion_dim itself, especially for scenario C/E's
+#   concatenated head input (fusion_dim*2 = 512 -> 32 -> 1).
+# - dropout lowered to 0.3, for BOTH the encoder (svg/tvg GATv2Conv
+#   layers) and the classifier head (previously always 0.35 regardless
+#   of encoder dropout, since no notebook ever overrode ClassifierHead's
+#   own default) -- prior runs at 0.45 (07b/07c/07e) looked worse, not
+#   better, so 0.3 is the low end of the 0.3-0.35 range to retry.
+# - categorical embedding dims doubled (cat_embed_dim, building_type_embed_dim,
+#   highway_embed_dim) -- still small relative to hidden_dim, but the old
+#   values (2/8/4) were tight even for the largest vocab (building_type,
+#   58+ categories post-04b unification).
+# - encoder depth (svg_layers/tvg_layers) left at 2 -- these are small
+#   graphs (README: "GPU recommended, not required"); more message-passing
+#   layers risks over-smoothing rather than fixing a real bottleneck, so
+#   the fusion/head width was judged the more likely "information
+#   evaporates" culprit, not encoder depth.
+# - head_depth: this run trains ONLY "mlp2" (one hidden layer + linear
+#   output -- the only non-trivial head this codebase has; "linear" is a
+#   bare Linear(in,1)). Not swept against "linear" here.
+hidden_dim: 128
+fusion_dim: 256
+head_hidden: 256
+head_dropout: 0.3
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.3
+cat_embed_dim: 4
+building_type_embed_dim: 16
+highway_embed_dim: 8
+head_depth: mlp2
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+- G
+ablation_scope:
+- B
+- C
+- D
+- E
+- F

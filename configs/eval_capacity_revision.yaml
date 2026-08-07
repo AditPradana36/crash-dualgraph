@@ -1,0 +1,47 @@
+# Eval config for the capacity-revision experiment
+# (07g_train_eval_capacity_revision.ipynb). Pooled Bogor+Warsaw dataset
+# (04b/05b), 70/15/15, PLAIN random re-splits -- run_scenario_random_repeats
+# stratifies by label_col only (not label x city like 07e's
+# _stratified_split_by_city), matching "just random" as requested rather
+# than reusing 07e's joint stratification.
+n_repeats: 5
+val_frac: 0.15
+test_frac: 0.15
+
+label_col: label
+target_pos_frac: null
+
+# epoch_cap fixed at 150 for every scenario in this run (was 400 in
+# 07c/07e). warmup_epochs/patience scaled down to fit a 150-epoch budget
+# instead of reusing 07c/07e's 100/40, which would leave almost no
+# post-warmup window at all against a 150 cap (earliest possible stop
+# here = 20 + 30 = epoch 50, leaving 100 epochs of headroom before the cap).
+warmup_epochs: 20
+epoch_cap: 150
+patience: 30
+lr_patience: 8
+
+# Fixed threshold -- this run isolates the architecture/capacity
+# variables (dims, dropout, embeddings, epoch budget), not threshold
+# policy. Adaptive thresholding is a separate, already-explored axis
+# (see 07c/07e).
+threshold_method: fixed
+
+batch_size: 128
+lr: 0.005
+weight_decay: 0.0001
+num_workers: 0
+use_amp: true
+metrics_descriptive_only:
+- pr_auc
+- auroc
+- f1
+- precision
+- recall
+- accuracy
+- bce_loss
+- threshold_used
+- threshold_method
+interpretability_methods:
+- attention_weights
+- gnnexplainer
