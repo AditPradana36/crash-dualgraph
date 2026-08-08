@@ -72,37 +72,35 @@ def process_incident(
     included_intersections = sorted(included_intersections)
     node_local_idx = {nid: i for i, nid in enumerate(included_intersections)}
 
-    # ── Peer incidents: same-city, same-fold, POSITIVE-labeled only, within threshold ──
-    # 01_data_prep_sampling.ipynb no longer assigns fold_rep{r} columns
-    # (CV folds are no longer applied at 01) -- crash_history is
-    # ablation-only and never used by the default (non-ablation)
-    # scenarios, so rather than guessing a replacement containment
-    # scheme, peers are simply empty whenever no fold_rep column exists.
-    # If fold_rep{r} columns DO exist (e.g. a reconciled_df from an older
-    # run, or a future notebook that reassigns them), same-fold matching
-    # is used exactly as before, still narrowed to same-city first --
-    # fold_rep{r} values are per-city cluster ids (0..k-1), not globally
-    # unique, so without the city check a Bogor point and a Somerville
-    # point sharing the same fold NUMBER could be treated as spatial
-    # peers despite being on different continents.
-    fold_cols = [c for c in reconciled_df.columns if c.startswith("fold_rep")]
-    if fold_cols:
-        fold_col = fold_cols[0]
-        same_fold = reconciled_df[
-            (reconciled_df[fold_col] == incident_row[fold_col])
-            & (reconciled_df["point_id"] != incident_row["point_id"])
-            & (reconciled_df["label"] == 1)  # HARD RULE: peers are never negative points
-        ]
-        if "city" in reconciled_df.columns:
-            same_fold = same_fold[same_fold["city"] == incident_row["city"]]
-    else:
-        same_fold = reconciled_df.iloc[0:0]  # no fold structure -- no peers, see above
+    # ── Peer incidents: same-city, POSITIVE-labeled only, within threshold ──
+    # Precomputed once here, at dataset-construction time (04) -- baked
+    # into the saved .pt graph, same as every other TVG relation, not
+    # deferred to training time.
+    #
+    # No fold/split constraint (01 no longer assigns fold_rep{r} columns
+    # at all). This DOES mean a point's peer_incident set can straddle
+    # whatever train/val/test split a downstream 07 run later draws --
+    # crash_history/peer_incident is opt-in (ablation scenarios B+
+    # through F+ only; never touched by the default A-F/G scenarios),
+    # and that leakage tradeoff was accepted explicitly rather than left
+    # as an unexamined side effect of removing folds.
+    #
+    # same-city: without this, e.g. a Bogor point and a Somerville point
+    # could be matched as "peers" purely by both being positive-labeled
+    # within threshold -- UTM coordinates aren't comparable across
+    # cities/CRSes, so this filter isn't optional the way it might look.
+    candidates = reconciled_df[
+        (reconciled_df["point_id"] != incident_row["point_id"])
+        & (reconciled_df["label"] == 1)  # HARD RULE: peers are never negative points
+    ]
+    if "city" in reconciled_df.columns:
+        candidates = candidates[candidates["city"] == incident_row["city"]]
 
-    if len(same_fold):
-        dists = np.hypot(same_fold["_utm_x"] - origin_xy[0], same_fold["_utm_y"] - origin_xy[1])
-        peers = same_fold[dists.values <= crash_history_threshold_m]
+    if len(candidates):
+        dists = np.hypot(candidates["_utm_x"] - origin_xy[0], candidates["_utm_y"] - origin_xy[1])
+        peers = candidates[dists.values <= crash_history_threshold_m]
     else:
-        peers = same_fold
+        peers = candidates
 
     # ── Assemble HeteroData ──────────────────────────────────────────
     data = HeteroData()
