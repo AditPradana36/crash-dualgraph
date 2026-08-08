@@ -22,6 +22,60 @@ from shapely.strtree import STRtree
 from shapely.geometry import box
 
 
+# ── Overpass API endpoint fallback ──────────────────────────────────────
+# overpass-api.de (osmnx's own default, ox.settings.overpass_url) is a
+# shared community resource that routinely times out or is unreachable
+# from Colab's network -- not a bug in this code, but common enough that
+# a single fetch call failing outright would otherwise kill an
+# multi-city 04 run over one flaky mirror. OVERPASS_MIRRORS are tried in
+# order; independent infrastructure from each other (not just load
+# balancers in front of the same origin), so an outage on one is
+# unlikely to also take out the others.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api",           # osmnx's own default
+    "https://overpass.kumi.systems/api",
+    "https://overpass.openstreetmap.ru/api",
+]
+
+# Bumped from osmnx's own default (180s) -- a whole city's building
+# footprints is a genuinely large Overpass query; 180s is tight even
+# against a reachable, healthy mirror, separate from the connect-timeout
+# failures OVERPASS_MIRRORS exists to route around.
+OVERPASS_REQUESTS_TIMEOUT = 300
+
+
+def _fetch_with_overpass_fallback(fetch_fn, mirrors=OVERPASS_MIRRORS):
+    """Calls fetch_fn() (a zero-arg closure wrapping an osmnx call that
+    hits the Overpass API), retrying with each mirror in `mirrors` set as
+    ox.settings.overpass_url in turn until one succeeds. Restores
+    osmnx's original overpass_url/requests_timeout afterward regardless
+    of outcome. Raises the LAST mirror's exception (chained) if every
+    mirror fails, rather than silently swallowing a genuine failure."""
+    original_url = ox.settings.overpass_url
+    original_timeout = ox.settings.requests_timeout
+    ox.settings.requests_timeout = OVERPASS_REQUESTS_TIMEOUT
+    last_exc = None
+    try:
+        for mirror in mirrors:
+            ox.settings.overpass_url = mirror
+            try:
+                return fetch_fn()
+            except Exception as e:
+                last_exc = e
+                print(f"  ⚠️  Overpass mirror {mirror} failed ({type(e).__name__}: {e}) — "
+                      f"trying next mirror." if mirror != mirrors[-1] else
+                      f"  ⚠️  Overpass mirror {mirror} failed ({type(e).__name__}: {e}).")
+        raise RuntimeError(
+            f"All {len(mirrors)} Overpass mirrors failed ({mirrors}). "
+            f"This is an OSM infrastructure/network issue, not a code bug -- "
+            f"try again later, from a different network, or add another "
+            f"mirror to osm_fetch.OVERPASS_MIRRORS."
+        ) from last_exc
+    finally:
+        ox.settings.overpass_url = original_url
+        ox.settings.requests_timeout = original_timeout
+
+
 def fetch_study_area_layers(boundary_geojson, bbox_padding_m, network_type="drive"):
     """Fetches buildings + street network across the study area's BOUNDING
     BOX (not polygon), padded by bbox_padding_m. Returns everything
@@ -42,11 +96,15 @@ def fetch_study_area_layers(boundary_geojson, bbox_padding_m, network_type="driv
     bbox_polygon_utm = box(minx, miny, maxx, maxy)
     bbox_polygon_wgs84 = gpd.GeoSeries([bbox_polygon_utm], crs=utm_crs).to_crs(epsg=4326).iloc[0]
 
-    buildings = ox.features_from_polygon(bbox_polygon_wgs84, tags={"building": True})
+    buildings = _fetch_with_overpass_fallback(
+        lambda: ox.features_from_polygon(bbox_polygon_wgs84, tags={"building": True})
+    )
     buildings = buildings[buildings.geometry.type.isin(["Polygon", "MultiPolygon"])].reset_index(drop=True)
     buildings_utm = buildings.to_crs(utm_crs)
 
-    G = ox.graph_from_polygon(bbox_polygon_wgs84, network_type=network_type)
+    G = _fetch_with_overpass_fallback(
+        lambda: ox.graph_from_polygon(bbox_polygon_wgs84, network_type=network_type)
+    )
     G_utm = ox.project_graph(G, to_crs=utm_crs)
 
     return buildings_utm, G_utm, utm_crs

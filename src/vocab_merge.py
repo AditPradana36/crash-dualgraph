@@ -147,10 +147,19 @@ def remap_one_graph(data, hw_remap, bt_remap):
 
 def remap_city_graphs(tvg_dir, out_dir, old_highway_vocab, new_highway_vocab,
                        old_building_vocab, new_building_vocab,
-                       highway_fallback="unclassified", building_fallback="unknown"):
-    """Reads every .pt in tvg_dir, remaps vocab indices, writes to out_dir
+                       highway_fallback="unclassified", building_fallback="unknown",
+                       point_ids=None):
+    """Reads every .pt in tvg_dir (or, if point_ids is given, only those
+    specific {point_id}.pt files), remaps vocab indices, writes to out_dir
     (kept SEPARATE from tvg_dir on purpose — never overwrite the originals
     in place; verify the remapped copies first, then swap directories).
+
+    point_ids: needed once multiple cities share ONE combined tvg_dir
+    (see 04b_vocab_unification.ipynb's multi-city setup) — each city's
+    remap pass must only touch its own files, not every *.pt in the
+    shared directory. None (default) preserves the original
+    glob-everything behavior, for a tvg_dir that only ever holds one
+    city's graphs.
     """
     tvg_dir = Path(tvg_dir)
     out_dir = Path(out_dir)
@@ -159,7 +168,16 @@ def remap_city_graphs(tvg_dir, out_dir, old_highway_vocab, new_highway_vocab,
     hw_remap = _remap_map(old_highway_vocab, new_highway_vocab, highway_fallback)
     bt_remap = _remap_map(old_building_vocab, new_building_vocab, building_fallback)
 
-    pt_files = sorted(tvg_dir.glob("*.pt"))
+    if point_ids is not None:
+        pt_files = [tvg_dir / f"{pid}.pt" for pid in point_ids]
+        missing = [p for p in pt_files if not p.exists()]
+        if missing:
+            print(f"  ⚠️  {len(missing)} expected file(s) not found in {tvg_dir} "
+                  f"(first 5): {[p.name for p in missing[:5]]}")
+        pt_files = [p for p in pt_files if p.exists()]
+    else:
+        pt_files = sorted(tvg_dir.glob("*.pt"))
+
     n_ok, n_err = 0, 0
     for pt_path in pt_files:
         try:
