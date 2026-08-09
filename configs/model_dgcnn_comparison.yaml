@@ -1,12 +1,12 @@
 # Model config for the Deep Graph CNN (DGCNN / SortPooling, Zhang et al.
 # 2018) readout comparison experiment (07i_train_eval_dgcnn.ipynb).
-# Same capacity baseline as model_capacity_revision.yaml (07g) /
-# model_gin_comparison.yaml (07h) -- conv_type stays "gatv2" (unchanged),
-# so readout is the ONLY conv/architecture variable vs. 07g. NOTE: unlike
-# 07h, this experiment's EVAL config also differs from 07g's
-# (epoch_cap/primary_metric -- see eval_dgcnn_comparison.yaml), so the
-# 07i-vs-07g comparison is not a clean single-variable swap; see that
-# config's header and 07i's own markdown for the full list of deviations.
+# Same capacity baseline as model_capacity_revision.yaml (07g) -- conv_type
+# stays "gatv2" (unchanged), so readout is the ONLY variable in this
+# comparison. This notebook reuses configs/eval_capacity_revision.yaml
+# UNCHANGED (not a copy) -- same convention 07h (GIN) already established
+# -- so readout is the ONLY thing that differs between 07g and 07i: same
+# 150-epoch budget, same accuracy-default primary_metric (train.py's own
+# default now, not config-driven here), same split/optimizer settings.
 #
 # readout: dgcnn -- swaps _pool_and_anchor for DGCNNReadout (SortPooling)
 # in SVGEncoder/TVGEncoder/UnifiedEncoder. See src/models.py's

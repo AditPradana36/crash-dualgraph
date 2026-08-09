@@ -82,26 +82,34 @@ def run_forward_unified(model, merged_batch, unified_node_types):
 
 
 def _run_epoch_eval(model, scenario, loader, device, svg_nt, tvg_nt, is_cuda=False, use_amp=False):
+    """Returns (y_true, y_prob, y_ids) -- y_ids is each item's point_id, in
+    the same order as y_true/y_prob (collate_fn/collate_pairs_unified
+    already carry it as the batch's 3rd/4th element, previously discarded
+    here via `_`). Needed to record per-point raw predictions (see
+    train_one_fold's test_predictions_path) -- every existing caller that
+    only wants (y_true, y_prob) just ignores the third value."""
     model.eval()
-    y_true, y_prob = [], []
+    y_true, y_prob, y_ids = [], [], []
     with torch.no_grad():
         if scenario == "F":
-            for merged_batch, labels, _ in loader:
+            for merged_batch, labels, pids in loader:
                 merged_batch = merged_batch.to(device, non_blocking=is_cuda)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                     logits = run_forward_unified(model, merged_batch, models.UNIFIED_NODE_TYPES)
                 y_prob.extend(torch.sigmoid(logits).float().cpu().tolist())
                 y_true.extend(labels.tolist())
-            return y_true, y_prob
+                y_ids.extend(pids)
+            return y_true, y_prob, y_ids
 
-        for svg_batch, tvg_batch, labels, _ in loader:
+        for svg_batch, tvg_batch, labels, pids in loader:
             svg_batch = svg_batch.to(device, non_blocking=is_cuda)
             tvg_batch = tvg_batch.to(device, non_blocking=is_cuda)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 logits = run_forward(model, scenario, svg_batch, tvg_batch, svg_nt, tvg_nt)
             y_prob.extend(torch.sigmoid(logits).float().cpu().tolist())
             y_true.extend(labels.tolist())
-    return y_true, y_prob
+            y_ids.extend(pids)
+    return y_true, y_prob, y_ids
 
 
 def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, test_items,
@@ -186,11 +194,12 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     svg_nt = models.SVG_NODE_TYPES
     tvg_nt = models.TVG_NODE_TYPES if use_ablation else [nt for nt in models.TVG_NODE_TYPES if nt != "peer_incident"]
 
-    # Model-selection metric -- defaults to PR-AUC (today's behavior for
-    # every existing 07/07b/.../07h notebook, unaffected unless a config
-    # explicitly sets this). 07i (DGCNN comparison) sets this to
-    # "accuracy" via eval_dgcnn_comparison.yaml.
-    PRIMARY_METRIC = config.get("primary_metric", "pr_auc")
+    # Model-selection metric -- defaults to ACCURACY for every branch
+    # (checkpoint selection, early-stopping, and the LR scheduler are all
+    # driven by this). A config can still override via "primary_metric"
+    # (e.g. "pr_auc") if a specific branch needs the old PR-AUC-driven
+    # behavior, but nothing does by default anymore.
+    PRIMARY_METRIC = config.get("primary_metric", "accuracy")
 
     best_val_prauc, best_state, no_improve = -1.0, None, 0
     best_train_loss, best_val_loss = None, None
@@ -229,23 +238,26 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
                 n_batches += 1
         train_loss = epoch_loss / max(n_batches, 1)
 
-        val_true, val_prob = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
-                                              is_cuda=is_cuda, use_amp=use_amp)
+        val_true, val_prob, _val_ids = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
+                                                        is_cuda=is_cuda, use_amp=use_amp)
         val_metrics = ev.compute_metrics(val_true, val_prob)
         if epoch >= warmup_epochs:
             scheduler.step(val_metrics[PRIMARY_METRIC])
 
         improved = val_metrics[PRIMARY_METRIC] > best_val_prauc
         history.append({"epoch": epoch, "train_loss": train_loss,
-                         "val_pr_auc": val_metrics["pr_auc"], "val_auroc": val_metrics.get("auroc"),
+                         "val_accuracy": val_metrics.get("accuracy"), "val_pr_auc": val_metrics["pr_auc"],
+                         "val_auroc": val_metrics.get("auroc"),
                          "lr": optimizer.param_groups[0]["lr"], "improved": improved})
 
         # Per-epoch progress, printed live as this cell runs (not just on
         # improvement/early-stop) -- the full history is already recorded
         # above regardless, this is purely so a running notebook cell shows
         # training happening rather than going quiet for the whole fold/repeat.
+        # val_accuracy shown first since it's PRIMARY_METRIC's default now.
         if verbose:
             print(f"    epoch {epoch:3d} | train_loss={train_loss:.4f} "
+                  f"| val_accuracy={val_metrics.get('accuracy', float('nan')):.4f} "
                   f"| val_pr_auc={val_metrics['pr_auc']:.4f} | val_auroc={val_metrics.get('auroc', float('nan')):.4f} "
                   f"| lr={optimizer.param_groups[0]['lr']:.2e}{'  <- best' if improved else ''}")
 
@@ -278,8 +290,8 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     if threshold_method == "fixed":
         chosen_threshold, threshold_method_used, threshold_score = config.get("threshold", 0.5), "fixed", float("nan")
     else:
-        val_true_best, val_prob_best = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
-                                                         is_cuda=is_cuda, use_amp=use_amp)
+        val_true_best, val_prob_best, _val_ids_best = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
+                                                                       is_cuda=is_cuda, use_amp=use_amp)
         chosen_threshold, threshold_method_used, threshold_score = ev.find_optimal_threshold(
             val_true_best, val_prob_best, method=threshold_method,
             fn_cost=config.get("threshold_fn_cost", 10.0),
@@ -289,10 +301,36 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
             print(f"    threshold ({threshold_method_used}) = {chosen_threshold:.4f} "
                   f"(val score={threshold_score:.4f})")
 
-    test_true, test_prob = _run_epoch_eval(model, scenario, test_loader, device, svg_nt, tvg_nt,
-                                            is_cuda=is_cuda, use_amp=use_amp)
+    test_true, test_prob, test_ids = _run_epoch_eval(model, scenario, test_loader, device, svg_nt, tvg_nt,
+                                                       is_cuda=is_cuda, use_amp=use_amp)
     test_metrics = ev.compute_metrics(test_true, test_prob, threshold=chosen_threshold)
     test_metrics["threshold_method"] = threshold_method_used
+
+    # Per-point raw predictions at test time -- point_id, true label, raw
+    # probability, predicted label, and confusion-matrix category
+    # (TP/TN/FP/FN at chosen_threshold) for every test point, so results
+    # across scenarios/branches can be compared point-by-point rather than
+    # only via aggregate metrics. Written next to the per-epoch history
+    # JSON (same repeat/fold, easy to find together) whenever history_path
+    # is given; skipped otherwise, same opt-in contract as history_path.
+    if history_path is not None:
+        def _category(true, pred):
+            if true == 1 and pred == 1:
+                return "TP"
+            if true == 0 and pred == 0:
+                return "TN"
+            if true == 0 and pred == 1:
+                return "FP"
+            return "FN"  # true == 1 and pred == 0
+
+        test_preds = [1 if p >= chosen_threshold else 0 for p in test_prob]
+        raw_predictions = [
+            {"point_id": pid, "label": int(true), "prob": float(prob), "pred": pred,
+             "category": _category(int(true), pred)}
+            for pid, true, prob, pred in zip(test_ids, test_true, test_prob, test_preds)
+        ]
+        predictions_path = Path(history_path).with_name(Path(history_path).stem + "_test_predictions.json")
+        predictions_path.write_text(json.dumps(_to_jsonable(raw_predictions), indent=1))
     # loss at the best (early-stopped) epoch, kept separate from
     # test_metrics["bce_loss"] which is BCE computed on the test split
     test_metrics["train_loss"] = best_train_loss
@@ -300,10 +338,11 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     # val_pr_auc is what model/checkpoint selection should use (see
     # run_scenario) -- surfaced here rather than changing the return
     # signature, since it's the metric that picked best_state in the
-    # first place. NOTE: despite the key name, this holds "best val score
-    # by whichever metric PRIMARY_METRIC names" -- historically always
-    # PR-AUC (hence the name), but e.g. 07i sets primary_metric="accuracy",
-    # in which case this key holds an accuracy value, not PR-AUC.
+    # first place. NOTE: despite the key name (kept for schema stability
+    # across every branch/notebook that already reads it), this holds
+    # "best val score by whichever metric PRIMARY_METRIC names" --
+    # ACCURACY by default now, not PR-AUC; only a config that explicitly
+    # sets primary_metric="pr_auc" makes this an actual PR-AUC value.
     test_metrics["val_pr_auc"] = best_val_prauc
 
     if history_path is not None:

@@ -11,14 +11,16 @@ test_frac: 0.15
 label_col: label
 target_pos_frac: null
 
-# epoch_cap fixed at 150 for every scenario in this run (was 400 in
-# 07c/07e). warmup_epochs/patience scaled down to fit a 150-epoch budget
-# instead of reusing 07c/07e's 100/40, which would leave almost no
-# post-warmup window at all against a 150 cap (earliest possible stop
-# here = 20 + 30 = epoch 50, leaving 100 epochs of headroom before the cap).
+# epoch_cap fixed at 150 for EVERY scenario/repeat in this run, STRICTLY
+# -- patience is set >= epoch_cap so early stopping can never fire within
+# the loop (`for epoch in range(epoch_cap)`: no_improve can reach at most
+# epoch_cap-1-warmup_epochs before the range is exhausted, always < 150
+# patience). This is shared by both 07g and 07i (07i reuses this file
+# unchanged), so both branches train every repeat for the full 150 epochs,
+# no exceptions -- not "at most 150."
 warmup_epochs: 20
 epoch_cap: 150
-patience: 30
+patience: 150
 lr_patience: 8
 
 # Fixed threshold -- this run isolates the architecture/capacity

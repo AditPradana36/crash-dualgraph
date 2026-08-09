@@ -10,7 +10,7 @@ own QC cell (one forward pass against a real graph pair from 05).
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import HeteroConv, GATv2Conv, GINEConv, global_mean_pool
+from torch_geometric.nn import HeteroConv, GATv2Conv, GINEConv, global_mean_pool, global_max_pool
 from torch_geometric.nn.aggr import SortAggregation
 
 
@@ -197,6 +197,51 @@ class DGCNNReadout(nn.Module):
         return F.relu(self.linear(h))
 
 
+class GlobalPoolReadout(nn.Module):
+    """Standard whole-graph-classification readout: concat[global_mean_pool,
+    global_max_pool] over EVERY node in the graph, regardless of node type
+    -- every node type shares the same width (hidden_dim) after
+    input_proj, so they can be pooled together as one bag of nodes rather
+    than per-type. Mean captures the graph's overall pattern; max
+    captures its most salient single signal -- concatenating both is a
+    standard strong default for graph classification (this task: incident
+    vs non-incident), used via PyG's own global_mean_pool/global_max_pool
+    (torch_geometric.nn.pool) rather than a hand-rolled reduction.
+
+    Unlike _pool_and_anchor, there is NO forced inclusion of the anchor
+    node's own embedding here -- a genuine, deliberate difference (same
+    property DGCNNReadout has, for the same reason: this is a true
+    graph-level pool, not an anchor-centric one)."""
+
+    def __init__(self, node_types, hidden_dim, out_dim=None):
+        super().__init__()
+        self.node_types = list(node_types)
+        self.out_dim_ = out_dim or hidden_dim * 2
+
+    def forward(self, x_dict, batch_dict, anchor_type):
+        anchor = x_dict[anchor_type]
+        device = anchor.device
+        num_graphs = batch_dict[anchor_type].max().item() + 1 if batch_dict is not None else 1
+
+        parts, idxs = [], []
+        for nt in self.node_types:
+            x = x_dict[nt]
+            if x.shape[0] == 0:
+                continue
+            parts.append(x)
+            batch = batch_dict[nt] if batch_dict is not None else torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            idxs.append(batch)
+
+        if not parts:
+            return torch.zeros(num_graphs, self.out_dim_, device=device)
+
+        x_all = torch.cat(parts, dim=0)
+        idx_all = torch.cat(idxs, dim=0)
+        mean_pooled = global_mean_pool(x_all, idx_all, size=num_graphs)
+        max_pooled = global_max_pool(x_all, idx_all, size=num_graphs)
+        return torch.cat([mean_pooled, max_pooled], dim=1)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # SVG Encoder
 # ─────────────────────────────────────────────────────────────────────────
@@ -221,7 +266,8 @@ class SVGEncoder(nn.Module):
     def __init__(self, hidden_dim=64, heads=4, num_layers=2, dropout=0.35,
                  signage_vocab=5, light_pole_vocab=4, road_marking_vocab=2, cat_embed_dim=2,
                  conv_type="gatv2", readout="pool_anchor", dgcnn_k=None,
-                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None):
+                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None,
+                 global_pool_out_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.readout = readout
@@ -256,6 +302,11 @@ class SVGEncoder(nn.Module):
             self.dgcnn = DGCNNReadout(SVG_NODE_TYPES, hidden_dim, num_layers, dgcnn_k,
                                        conv1_out=dgcnn_conv1_out, conv2_out=dgcnn_conv2_out,
                                        conv2_kernel=dgcnn_conv2_kernel, out_dim=dgcnn_out_dim)
+        elif readout == "global_pool":
+            self.global_pool = GlobalPoolReadout(SVG_NODE_TYPES, hidden_dim, out_dim=global_pool_out_dim)
+        elif readout != "pool_anchor":
+            raise ValueError(f"SVGEncoder: unknown readout {readout!r} "
+                              f"(expected 'pool_anchor', 'dgcnn', or 'global_pool')")
 
     def assemble_inputs(self, data):
         x_dict = {"ego": data["ego"].x}
@@ -290,12 +341,16 @@ class SVGEncoder(nn.Module):
 
         if self.readout == "dgcnn":
             return self.dgcnn(x_dicts_per_layer, batch_dict, anchor_type="ego")
+        if self.readout == "global_pool":
+            return self.global_pool(x_dict, batch_dict, anchor_type="ego")
         return _pool_and_anchor(x_dict, batch_dict, anchor_type="ego")
 
     @property
     def out_dim(self):
         if self.readout == "dgcnn":
             return self.dgcnn.out_dim_
+        if self.readout == "global_pool":
+            return self.global_pool.out_dim_
         return self.hidden_dim * 2  # pool + anchor concat
 
 
@@ -326,7 +381,8 @@ class TVGEncoder(nn.Module):
                  building_type_embed_dim=8, highway_embed_dim=4,
                  continuous_missing_dim=4, use_ablation_edges=False,
                  conv_type="gatv2", readout="pool_anchor", dgcnn_k=None,
-                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None):
+                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None,
+                 global_pool_out_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_ablation_edges = use_ablation_edges
@@ -385,6 +441,13 @@ class TVGEncoder(nn.Module):
             self.dgcnn = DGCNNReadout(dgcnn_node_types, hidden_dim, num_layers, dgcnn_k,
                                        conv1_out=dgcnn_conv1_out, conv2_out=dgcnn_conv2_out,
                                        conv2_kernel=dgcnn_conv2_kernel, out_dim=dgcnn_out_dim)
+        elif readout == "global_pool":
+            gp_node_types = TVG_NODE_TYPES if use_ablation_edges else \
+                [nt for nt in TVG_NODE_TYPES if nt != "peer_incident"]
+            self.global_pool = GlobalPoolReadout(gp_node_types, hidden_dim, out_dim=global_pool_out_dim)
+        elif readout != "pool_anchor":
+            raise ValueError(f"TVGEncoder: unknown readout {readout!r} "
+                              f"(expected 'pool_anchor', 'dgcnn', or 'global_pool')")
 
     def assemble_inputs(self, data):
         hw_idx = data["incident"].highway_type_idx
@@ -439,12 +502,16 @@ class TVGEncoder(nn.Module):
 
         if self.readout == "dgcnn":
             return self.dgcnn(x_dicts_per_layer, batch_dict, anchor_type="incident")
+        if self.readout == "global_pool":
+            return self.global_pool(x_dict, batch_dict, anchor_type="incident")
         return _pool_and_anchor(x_dict, batch_dict, anchor_type="incident")
 
     @property
     def out_dim(self):
         if self.readout == "dgcnn":
             return self.dgcnn.out_dim_
+        if self.readout == "global_pool":
+            return self.global_pool.out_dim_
         return self.hidden_dim * 2
 
 
@@ -598,7 +665,8 @@ class UnifiedEncoder(nn.Module):
                  building_type_embed_dim=8, highway_embed_dim=4,
                  continuous_missing_dim=4, use_ablation_edges=False,
                  conv_type="gatv2", readout="pool_anchor", dgcnn_k=None,
-                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None):
+                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None,
+                 global_pool_out_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_ablation_edges = use_ablation_edges
@@ -674,6 +742,11 @@ class UnifiedEncoder(nn.Module):
             self.dgcnn = DGCNNReadout(node_types, hidden_dim, num_layers, dgcnn_k,
                                        conv1_out=dgcnn_conv1_out, conv2_out=dgcnn_conv2_out,
                                        conv2_kernel=dgcnn_conv2_kernel, out_dim=dgcnn_out_dim)
+        elif readout == "global_pool":
+            self.global_pool = GlobalPoolReadout(node_types, hidden_dim, out_dim=global_pool_out_dim)
+        elif readout != "pool_anchor":
+            raise ValueError(f"UnifiedEncoder: unknown readout {readout!r} "
+                              f"(expected 'pool_anchor', 'dgcnn', or 'global_pool')")
 
     def assemble_inputs(self, data):
         x_dict = {"ego": data["ego"].x}
@@ -741,12 +814,16 @@ class UnifiedEncoder(nn.Module):
 
         if self.readout == "dgcnn":
             return self.dgcnn(x_dicts_per_layer, batch_dict, anchor_type="incident")
+        if self.readout == "global_pool":
+            return self.global_pool(x_dict, batch_dict, anchor_type="incident")
         return _pool_and_anchor(x_dict, batch_dict, anchor_type="incident")
 
     @property
     def out_dim(self):
         if self.readout == "dgcnn":
             return self.dgcnn.out_dim_
+        if self.readout == "global_pool":
+            return self.global_pool.out_dim_
         return self.hidden_dim * 2
 
 
