@@ -11,11 +11,15 @@
 #   src/models.py's ClassifierHead default) -- 32 was a far sharper
 #   bottleneck than fusion_dim itself, especially for scenario C/E's
 #   concatenated head input (fusion_dim*2 = 512 -> 32 -> 1).
-# - dropout lowered to 0.3, for BOTH the encoder (svg/tvg GATv2Conv
-#   layers) and the classifier head (previously always 0.35 regardless
-#   of encoder dropout, since no notebook ever overrode ClassifierHead's
-#   own default) -- prior runs at 0.45 (07b/07c/07e) looked worse, not
-#   better, so 0.3 is the low end of the 0.3-0.35 range to retry.
+# - encoder dropout lowered to 0.3 -- prior runs at 0.45 (07b/07c/07e)
+#   looked worse, not better, so 0.3 is the low end of the 0.3-0.35 range
+#   to retry.
+# - head_dropout raised to 0.5 (a deliberate, separate knob from encoder
+#   dropout -- both are notebook-config-driven, not tied together). NOTE:
+#   the 07g/07i notebooks currently HARDCODE head_dropout=0.5 directly in
+#   their config dicts rather than reading this key, so this value is
+#   kept here for documentation/consistency only -- see each notebook's
+#   own config-setup cell for the value actually in effect.
 # - categorical embedding dims doubled (cat_embed_dim, building_type_embed_dim,
 #   highway_embed_dim) -- still small relative to hidden_dim, but the old
 #   values (2/8/4) were tight even for the largest vocab (building_type,
@@ -31,7 +35,7 @@
 hidden_dim: 128
 fusion_dim: 256
 head_hidden: 256
-head_dropout: 0.3
+head_dropout: 0.5
 heads: 4
 svg_layers: 2
 tvg_layers: 2

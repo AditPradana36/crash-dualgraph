@@ -5,7 +5,7 @@
 # comparison. This notebook reuses configs/eval_capacity_revision.yaml
 # UNCHANGED (not a copy) -- same convention 07h (GIN) already established
 # -- so readout is the ONLY thing that differs between 07g and 07i: same
-# 150-epoch budget, same accuracy-default primary_metric (train.py's own
+# 100-epoch budget, same accuracy-default primary_metric (train.py's own
 # default now, not config-driven here), same split/optimizer settings.
 #
 # readout: dgcnn -- swaps _pool_and_anchor for DGCNNReadout (SortPooling)
@@ -33,7 +33,10 @@
 hidden_dim: 128
 fusion_dim: 256
 head_hidden: 256
-head_dropout: 0.3
+# NOTE: 07g/07i notebooks currently HARDCODE head_dropout=0.5 directly in
+# their config dicts rather than reading this key -- kept here for
+# documentation/consistency only, see each notebook's config-setup cell.
+head_dropout: 0.5
 heads: 4
 svg_layers: 2
 tvg_layers: 2

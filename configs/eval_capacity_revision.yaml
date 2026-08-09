@@ -1,27 +1,27 @@
 # Eval config for the capacity-revision experiment
-# (07g_train_eval_capacity_revision.ipynb). Pooled Bogor+Warsaw dataset
-# (04b/05b), 70/15/15, PLAIN random re-splits -- run_scenario_random_repeats
-# stratifies by label_col only (not label x city like 07e's
-# _stratified_split_by_city), matching "just random" as requested rather
-# than reusing 07e's joint stratification.
+# (07g_train_eval_capacity_revision.ipynb). Pooled multi-city dataset,
+# PLAIN random re-splits -- run_scenario_random_repeats stratifies by
+# label_col only (not label x city like 07e's _stratified_split_by_city),
+# matching "just random" as requested rather than reusing 07e's joint
+# stratification.
 n_repeats: 5
 val_frac: 0.15
-test_frac: 0.15
+test_frac: 0.10
 
 label_col: label
 target_pos_frac: null
 
-# epoch_cap fixed at 150 for EVERY scenario/repeat in this run, STRICTLY
+# epoch_cap fixed at 100 for EVERY scenario/repeat in this run, STRICTLY
 # -- patience is set >= epoch_cap so early stopping can never fire within
 # the loop (`for epoch in range(epoch_cap)`: no_improve can reach at most
-# epoch_cap-1-warmup_epochs before the range is exhausted, always < 150
+# epoch_cap-1-warmup_epochs before the range is exhausted, always < 100
 # patience). This is shared by both 07g and 07i (07i reuses this file
-# unchanged), so both branches train every repeat for the full 150 epochs,
-# no exceptions -- not "at most 150."
-warmup_epochs: 20
-epoch_cap: 150
-patience: 150
-lr_patience: 8
+# unchanged), so both branches train every repeat for the full 100 epochs,
+# no exceptions -- not "at most 100."
+warmup_epochs: 0
+epoch_cap: 100
+patience: 100
+lr_patience: 3
 
 # Fixed threshold -- this run isolates the architecture/capacity
 # variables (dims, dropout, embeddings, epoch budget), not threshold
@@ -30,9 +30,9 @@ lr_patience: 8
 threshold_method: fixed
 
 batch_size: 128
-lr: 0.005
-weight_decay: 0.0001
-num_workers: 0
+lr: 0.001
+weight_decay: 0.001
+num_workers: 2
 use_amp: true
 metrics_descriptive_only:
 - pr_auc

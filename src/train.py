@@ -281,17 +281,20 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
 
     model.load_state_dict(best_state)
 
-    # Threshold: re-run the best (early-stopped) epoch's VAL predictions
-    # once more here (cheap -- val is small, one forward pass) to fit the
-    # threshold on the exact weights being evaluated. Frozen and reused
-    # unchanged on test below -- test-set data never touches threshold
-    # selection, only best_state weights + val predictions do.
+    # Re-run the best (early-stopped) epoch's VAL predictions once more
+    # here (cheap -- val is small, one forward pass) -- ALWAYS, not just
+    # for adaptive thresholding, since this is also what lets us report a
+    # full val-split metric suite (not just the single scalar tracked
+    # during training) alongside test below. Threshold is fit on this
+    # same val pass when threshold_method != "fixed"; frozen and reused
+    # unchanged on test either way -- test-set data never touches
+    # threshold selection, only best_state weights + val predictions do.
+    val_true_best, val_prob_best, val_ids_best = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
+                                                                   is_cuda=is_cuda, use_amp=use_amp)
     threshold_method = config.get("threshold_method", "fixed")
     if threshold_method == "fixed":
         chosen_threshold, threshold_method_used, threshold_score = config.get("threshold", 0.5), "fixed", float("nan")
     else:
-        val_true_best, val_prob_best, _val_ids_best = _run_epoch_eval(model, scenario, val_loader, device, svg_nt, tvg_nt,
-                                                                       is_cuda=is_cuda, use_amp=use_amp)
         chosen_threshold, threshold_method_used, threshold_score = ev.find_optimal_threshold(
             val_true_best, val_prob_best, method=threshold_method,
             fn_cost=config.get("threshold_fn_cost", 10.0),
@@ -301,18 +304,18 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
             print(f"    threshold ({threshold_method_used}) = {chosen_threshold:.4f} "
                   f"(val score={threshold_score:.4f})")
 
+    val_metrics = ev.compute_metrics(val_true_best, val_prob_best, threshold=chosen_threshold)
+    val_metrics["threshold_method"] = threshold_method_used
+
     test_true, test_prob, test_ids = _run_epoch_eval(model, scenario, test_loader, device, svg_nt, tvg_nt,
                                                        is_cuda=is_cuda, use_amp=use_amp)
     test_metrics = ev.compute_metrics(test_true, test_prob, threshold=chosen_threshold)
     test_metrics["threshold_method"] = threshold_method_used
 
-    # Per-point raw predictions at test time -- point_id, true label, raw
-    # probability, predicted label, and confusion-matrix category
-    # (TP/TN/FP/FN at chosen_threshold) for every test point, so results
-    # across scenarios/branches can be compared point-by-point rather than
-    # only via aggregate metrics. Written next to the per-epoch history
-    # JSON (same repeat/fold, easy to find together) whenever history_path
-    # is given; skipped otherwise, same opt-in contract as history_path.
+    # Per-point raw predictions + full aggregate metrics, for BOTH splits,
+    # written to files next to the per-epoch history JSON (same
+    # repeat/fold, easy to find together) whenever history_path is given;
+    # skipped otherwise, same opt-in contract as history_path.
     if history_path is not None:
         def _category(true, pred):
             if true == 1 and pred == 1:
@@ -323,14 +326,35 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
                 return "FP"
             return "FN"  # true == 1 and pred == 0
 
-        test_preds = [1 if p >= chosen_threshold else 0 for p in test_prob]
-        raw_predictions = [
-            {"point_id": pid, "label": int(true), "prob": float(prob), "pred": pred,
-             "category": _category(int(true), pred)}
-            for pid, true, prob, pred in zip(test_ids, test_true, test_prob, test_preds)
-        ]
+        def _raw_predictions(ids, trues, probs):
+            preds = [1 if p >= chosen_threshold else 0 for p in probs]
+            return [
+                {"point_id": pid, "label": int(true), "prob": float(prob), "pred": pred,
+                 "category": _category(int(true), pred)}
+                for pid, true, prob, pred in zip(ids, trues, probs, preds)
+            ]
+
+        # Test-only, flat-list file -- UNCHANGED name/shape from before,
+        # since 07g/07i's aggregation cells and 08g/08i's point-selection
+        # helpers already depend on this exact file existing.
+        test_predictions = _raw_predictions(test_ids, test_true, test_prob)
         predictions_path = Path(history_path).with_name(Path(history_path).stem + "_test_predictions.json")
-        predictions_path.write_text(json.dumps(_to_jsonable(raw_predictions), indent=1))
+        predictions_path.write_text(json.dumps(_to_jsonable(test_predictions), indent=1))
+
+        # Combined val+test file -- full metric suite (pr_auc, auroc,
+        # accuracy, f1, precision, recall, bce_loss, confusion counts,
+        # threshold_used/method) AND per-point raw predictions for BOTH
+        # splits, in ONE json, so validation performance is never only a
+        # single scalar buried in per-epoch history -- it gets the same
+        # reporting depth test does, at the exact same (best-epoch)
+        # weights.
+        val_test_path = Path(history_path).with_name(Path(history_path).stem + "_val_test_metrics.json")
+        val_test_payload = {
+            "val": {"metrics": val_metrics, "predictions": _raw_predictions(val_ids_best, val_true_best, val_prob_best)},
+            "test": {"metrics": test_metrics, "predictions": test_predictions},
+        }
+        val_test_path.write_text(json.dumps(_to_jsonable(val_test_payload), indent=1))
+
     # loss at the best (early-stopped) epoch, kept separate from
     # test_metrics["bce_loss"] which is BCE computed on the test split
     test_metrics["train_loss"] = best_train_loss
@@ -348,7 +372,14 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     if history_path is not None:
         Path(history_path).write_text(json.dumps(_to_jsonable(history), indent=1))
 
-    return test_metrics, best_state
+    # `stats` (fit ONLY on this fold/repeat's train partition, see
+    # ds.fit_normalization above) is what best_state's weights were
+    # actually trained against -- without it, nothing downstream (e.g.
+    # explain.py's GNNExplainer/attention extraction on a reloaded
+    # checkpoint) can correctly reproduce the input distribution the
+    # model expects. Returned so callers can persist it next to
+    # best_model.pt whenever that checkpoint is saved (see run_scenario_*).
+    return test_metrics, best_state, stats
 
 
 def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config, svg_kwargs, tvg_kwargs,
@@ -386,6 +417,11 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
     # all folds -- the number that should be reported -- is unaffected by
     # which single fold's weights happen to be saved here.
     best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    # Normalization stats (mean/std per SVG/TVG node type, see
+    # ds.fit_normalization) for whichever fold/repeat's weights end up
+    # saved to best_model_path -- without this, best_model.pt alone can't
+    # be correctly re-run on new inputs later (e.g. explain.py).
+    best_model_stats_path = checkpoint_dir / f"{tag}_best_model_stats.pt"
     best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
     best_so_far = (json.loads(best_model_meta_path.read_text())
                    if best_model_meta_path.exists() else None)
@@ -411,7 +447,7 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
                 print(f"  -- {fold_col} fold {fold_id} (n_train={n_train}, n_test={len(test_df)}) --")
 
             fold_history_path = history_dir / f"{fold_col}_fold{fold_id}.json"
-            test_metrics, best_state = train_one_fold(
+            test_metrics, best_state, fold_stats = train_one_fold(
                 scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
                 svg_kwargs, tvg_kwargs, config, device,
                 verbose=verbose, history_path=fold_history_path,
@@ -419,6 +455,7 @@ def run_scenario(scenario, head_depth, use_ablation, dataset, fold_cols, config,
 
             if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
                 torch.save(best_state, best_model_path)
+                torch.save(fold_stats, best_model_stats_path)
                 best_so_far = {"fold_col": fold_col, "fold_id": int(fold_id),
                                 "val_pr_auc": test_metrics["val_pr_auc"],
                                 "test_pr_auc": test_metrics["pr_auc"],
@@ -479,6 +516,11 @@ def run_scenario_bootstrap(scenario, head_depth, use_ablation, dataset, n_repeat
     # see run_scenario's docstring/comments for the reasoning. Only the
     # single best repeat's weights are kept on disk.
     best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    # Normalization stats (mean/std per SVG/TVG node type, see
+    # ds.fit_normalization) for whichever fold/repeat's weights end up
+    # saved to best_model_path -- without this, best_model.pt alone can't
+    # be correctly re-run on new inputs later (e.g. explain.py).
+    best_model_stats_path = checkpoint_dir / f"{tag}_best_model_stats.pt"
     best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
     best_so_far = (json.loads(best_model_meta_path.read_text())
                    if best_model_meta_path.exists() else None)
@@ -523,7 +565,7 @@ def run_scenario_bootstrap(scenario, head_depth, use_ablation, dataset, n_repeat
                   f"n_train={len(train_df)}, n_val={len(val_df)}, n_test={len(test_df)}) --")
 
         repeat_history_path = history_dir / f"repeat{repeat}.json"
-        test_metrics, best_state = train_one_fold(
+        test_metrics, best_state, fold_stats = train_one_fold(
             scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
             svg_kwargs, tvg_kwargs, config, device,
             verbose=verbose, history_path=repeat_history_path,
@@ -531,6 +573,7 @@ def run_scenario_bootstrap(scenario, head_depth, use_ablation, dataset, n_repeat
 
         if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
             torch.save(best_state, best_model_path)
+            torch.save(fold_stats, best_model_stats_path)
             best_so_far = {"repeat": repeat,
                             "val_pr_auc": test_metrics["val_pr_auc"],
                             "test_pr_auc": test_metrics["pr_auc"],
@@ -718,6 +761,11 @@ def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_r
     done_repeats = {r["repeat"] for r in results}
 
     best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    # Normalization stats (mean/std per SVG/TVG node type, see
+    # ds.fit_normalization) for whichever fold/repeat's weights end up
+    # saved to best_model_path -- without this, best_model.pt alone can't
+    # be correctly re-run on new inputs later (e.g. explain.py).
+    best_model_stats_path = checkpoint_dir / f"{tag}_best_model_stats.pt"
     best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
     best_so_far = (json.loads(best_model_meta_path.read_text())
                    if best_model_meta_path.exists() else None)
@@ -763,7 +811,7 @@ def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_r
                   f"n_train={len(train_df)}, n_val={len(val_df)}, n_test={len(test_df)}{pos_rates}) --")
 
         repeat_history_path = history_dir / f"repeat{repeat}.json"
-        test_metrics, best_state = train_one_fold(
+        test_metrics, best_state, fold_stats = train_one_fold(
             scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
             svg_kwargs, tvg_kwargs, config, device,
             verbose=verbose, history_path=repeat_history_path,
@@ -771,6 +819,7 @@ def run_scenario_random_repeats(scenario, head_depth, use_ablation, dataset, n_r
 
         if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
             torch.save(best_state, best_model_path)
+            torch.save(fold_stats, best_model_stats_path)
             best_so_far = {"repeat": repeat,
                             "val_pr_auc": test_metrics["val_pr_auc"],
                             "test_pr_auc": test_metrics["pr_auc"],
@@ -838,6 +887,11 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
     # since val IS test in this scheme, it's numerically identical to
     # test_metrics["pr_auc"] for the SAME epoch, not an independent check.
     best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    # Normalization stats (mean/std per SVG/TVG node type, see
+    # ds.fit_normalization) for whichever fold/repeat's weights end up
+    # saved to best_model_path -- without this, best_model.pt alone can't
+    # be correctly re-run on new inputs later (e.g. explain.py).
+    best_model_stats_path = checkpoint_dir / f"{tag}_best_model_stats.pt"
     best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
     best_so_far = (json.loads(best_model_meta_path.read_text())
                    if best_model_meta_path.exists() else None)
@@ -885,7 +939,7 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
         # test_items passed as BOTH val_items and test_items -- this is the
         # explicit, intentional leak described in the docstring above.
         test_items_list = _items(test_df)
-        test_metrics, best_state = train_one_fold(
+        test_metrics, best_state, fold_stats = train_one_fold(
             scenario, head_depth, use_ablation, _items(train_df), test_items_list, test_items_list,
             svg_kwargs, tvg_kwargs, config, device,
             verbose=verbose, history_path=repeat_history_path,
@@ -893,6 +947,7 @@ def run_scenario_train_test_repeats(scenario, head_depth, use_ablation, dataset,
 
         if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
             torch.save(best_state, best_model_path)
+            torch.save(fold_stats, best_model_stats_path)
             best_so_far = {"repeat": repeat,
                             "val_pr_auc": test_metrics["val_pr_auc"],
                             "test_pr_auc": test_metrics["pr_auc"],
@@ -967,6 +1022,11 @@ def run_scenario_cv_repeats(scenario, head_depth, use_ablation, dataset, n_repea
     done_repeats = {r["repeat"] for r in results}
 
     best_model_path = checkpoint_dir / f"{tag}_best_model.pt"
+    # Normalization stats (mean/std per SVG/TVG node type, see
+    # ds.fit_normalization) for whichever fold/repeat's weights end up
+    # saved to best_model_path -- without this, best_model.pt alone can't
+    # be correctly re-run on new inputs later (e.g. explain.py).
+    best_model_stats_path = checkpoint_dir / f"{tag}_best_model_stats.pt"
     best_model_meta_path = checkpoint_dir / f"{tag}_best_model_meta.json"
     best_so_far = (json.loads(best_model_meta_path.read_text())
                    if best_model_meta_path.exists() else None)
@@ -1007,7 +1067,7 @@ def run_scenario_cv_repeats(scenario, head_depth, use_ablation, dataset, n_repea
                   f"n_val={len(val_df)}, n_test={len(test_df)}{pos_rates}{city_note}) --")
 
         repeat_history_path = history_dir / f"repeat{repeat}.json"
-        test_metrics, best_state = train_one_fold(
+        test_metrics, best_state, fold_stats = train_one_fold(
             scenario, head_depth, use_ablation, _items(train_df), _items(val_df), _items(test_df),
             svg_kwargs, tvg_kwargs, config, device,
             verbose=verbose, history_path=repeat_history_path,
@@ -1015,6 +1075,7 @@ def run_scenario_cv_repeats(scenario, head_depth, use_ablation, dataset, n_repea
 
         if best_so_far is None or test_metrics["val_pr_auc"] > best_so_far["val_pr_auc"]:
             torch.save(best_state, best_model_path)
+            torch.save(fold_stats, best_model_stats_path)
             best_so_far = {"repeat": repeat,
                             "val_pr_auc": test_metrics["val_pr_auc"],
                             "test_pr_auc": test_metrics["pr_auc"],

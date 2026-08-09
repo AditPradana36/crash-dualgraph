@@ -271,6 +271,7 @@ class SVGEncoder(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.readout = readout
+        self.conv_type = conv_type
 
         self.signage_embed = CategoricalEmbedder(signage_vocab, cat_embed_dim)
         self.light_pole_embed = CategoricalEmbedder(light_pole_vocab, cat_embed_dim)
@@ -387,6 +388,7 @@ class TVGEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_ablation_edges = use_ablation_edges
         self.readout = readout
+        self.conv_type = conv_type
 
         self.building_type_embed = CategoricalEmbedder(building_type_vocab, building_type_embed_dim)
         # ONE shared highway embedding table — reused for the incident node's
