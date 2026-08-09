@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, GATv2Conv, GINEConv, global_mean_pool
+from torch_geometric.nn.aggr import SortAggregation
 
 
 def _make_conv(conv_type, hidden_dim, heads, edge_dim, add_self_loops):
@@ -122,6 +123,80 @@ def _pool_and_anchor(x_dict, batch_dict, anchor_type):
     return torch.cat([pooled, anchor_pooled], dim=1)
 
 
+class DGCNNReadout(nn.Module):
+    """SortPooling readout (Zhang et al. 2018, "An End-to-End Deep
+    Learning Architecture for Graph Classification"): concatenate every
+    conv layer's per-node channels, sort nodes descending by their value
+    in the LAST layer's LAST channel, truncate/pad to a fixed k nodes,
+    then run 1D convs over that fixed-size sorted sequence.
+
+    Alternative to _pool_and_anchor, selected via each encoder's
+    readout="dgcnn" constructor arg. Ends at a plain embedding vector —
+    no classification layer here, ClassifierHead stays the shared job
+    outside the encoder."""
+
+    def __init__(self, node_types, hidden_dim, num_layers, k,
+                 conv1_out=16, conv2_out=32, conv2_kernel=5, out_dim=None):
+        super().__init__()
+        self.node_types = list(node_types)
+        self.k = k
+        # +1: input_proj's own output (pre-message-passing) counts as the
+        # paper's h^0 "layer", same convention as the original DGCNN.
+        self.total_channels = hidden_dim * (num_layers + 1)
+        self.out_dim_ = out_dim or hidden_dim * 2
+
+        floor_k = (conv2_kernel - 1) * 2 + 2  # smallest k s.t. floor((k-2)/2)+1 >= conv2_kernel
+        assert k >= floor_k, (
+            f"DGCNNReadout: k={k} is too small for conv2_kernel={conv2_kernel} -- "
+            f"MaxPool1d(2) then Conv1d(kernel={conv2_kernel}) requires k >= {floor_k}."
+        )
+
+        self.sort_pool = SortAggregation(k)
+        self.conv1 = nn.Conv1d(1, conv1_out, kernel_size=self.total_channels, stride=self.total_channels)
+        self.maxpool = nn.MaxPool1d(2)
+        self.conv2 = nn.Conv1d(conv1_out, conv2_out, kernel_size=conv2_kernel)
+        flat_dim = conv2_out * (((k - 2) // 2 + 1) - conv2_kernel + 1)
+        self.linear = nn.Linear(flat_dim, self.out_dim_)
+
+    def forward(self, x_dicts_per_layer, batch_dict, anchor_type):
+        device = x_dicts_per_layer[0][anchor_type].device
+        num_graphs = batch_dict[anchor_type].max().item() + 1 if batch_dict is not None else 1
+
+        row_counts = [x_dicts_per_layer[0][nt].shape[0] for nt in self.node_types]
+        for snapshot in x_dicts_per_layer[1:]:
+            assert [snapshot[nt].shape[0] for nt in self.node_types] == row_counts, (
+                "DGCNNReadout: node row counts changed across layers -- conv layers must "
+                "never reorder or change per-type node count for cross-layer concat to be valid."
+            )
+
+        parts_by_type = []
+        index_by_type = []
+        for nt in self.node_types:
+            n = row_counts[self.node_types.index(nt)]
+            if n == 0:
+                continue
+            feat = torch.cat([snapshot[nt] for snapshot in x_dicts_per_layer], dim=1)
+            parts_by_type.append(feat)
+            batch = batch_dict[nt] if batch_dict is not None else torch.zeros(n, dtype=torch.long, device=device)
+            index_by_type.append(batch)
+
+        if not parts_by_type:
+            pooled = torch.zeros(num_graphs, self.k * self.total_channels, device=device)
+        else:
+            x = torch.cat(parts_by_type, dim=0)
+            index = torch.cat(index_by_type, dim=0)
+            order = torch.argsort(index, stable=True)
+            x, index = x[order], index[order]
+            pooled = self.sort_pool(x, index, dim_size=num_graphs)  # [B, k*total_channels]
+
+        h = pooled.unsqueeze(1)  # [B, 1, k*total_channels]
+        h = F.relu(self.conv1(h))
+        h = self.maxpool(h)
+        h = F.relu(self.conv2(h))
+        h = h.reshape(h.shape[0], -1)
+        return F.relu(self.linear(h))
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # SVG Encoder
 # ─────────────────────────────────────────────────────────────────────────
@@ -145,9 +220,11 @@ SVG_EDGE_DIM = {"sees": 2, "mounted_with": 1, "near": 1}
 class SVGEncoder(nn.Module):
     def __init__(self, hidden_dim=64, heads=4, num_layers=2, dropout=0.35,
                  signage_vocab=5, light_pole_vocab=4, road_marking_vocab=2, cat_embed_dim=2,
-                 conv_type="gatv2"):
+                 conv_type="gatv2", readout="pool_anchor", dgcnn_k=None,
+                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.readout = readout
 
         self.signage_embed = CategoricalEmbedder(signage_vocab, cat_embed_dim)
         self.light_pole_embed = CategoricalEmbedder(light_pole_vocab, cat_embed_dim)
@@ -174,6 +251,12 @@ class SVGEncoder(nn.Module):
             self.norms.append(nn.ModuleDict({nt: nn.LayerNorm(hidden_dim) for nt in SVG_NODE_TYPES}))
         self.dropout = dropout
 
+        if readout == "dgcnn":
+            assert dgcnn_k is not None, "SVGEncoder: dgcnn_k is required when readout='dgcnn'"
+            self.dgcnn = DGCNNReadout(SVG_NODE_TYPES, hidden_dim, num_layers, dgcnn_k,
+                                       conv1_out=dgcnn_conv1_out, conv2_out=dgcnn_conv2_out,
+                                       conv2_kernel=dgcnn_conv2_kernel, out_dim=dgcnn_out_dim)
+
     def assemble_inputs(self, data):
         x_dict = {"ego": data["ego"].x}
 
@@ -196,15 +279,23 @@ class SVGEncoder(nn.Module):
         edge_index_dict = data.edge_index_dict
         edge_attr_dict = data.edge_attr_dict
 
+        x_dicts_per_layer = [x_dict] if self.readout == "dgcnn" else None
+
         for conv, norm in zip(self.convs, self.norms):
             x_dict = conv(x_dict, edge_index_dict, edge_attr_dict)
             x_dict = {nt: F.dropout(F.elu(norm[nt](x)), p=self.dropout, training=self.training)
                        for nt, x in x_dict.items()}
+            if x_dicts_per_layer is not None:
+                x_dicts_per_layer.append(x_dict)
 
+        if self.readout == "dgcnn":
+            return self.dgcnn(x_dicts_per_layer, batch_dict, anchor_type="ego")
         return _pool_and_anchor(x_dict, batch_dict, anchor_type="ego")
 
     @property
     def out_dim(self):
+        if self.readout == "dgcnn":
+            return self.dgcnn.out_dim_
         return self.hidden_dim * 2  # pool + anchor concat
 
 
@@ -234,10 +325,12 @@ class TVGEncoder(nn.Module):
                  building_type_vocab=58, highway_vocab=13,
                  building_type_embed_dim=8, highway_embed_dim=4,
                  continuous_missing_dim=4, use_ablation_edges=False,
-                 conv_type="gatv2"):
+                 conv_type="gatv2", readout="pool_anchor", dgcnn_k=None,
+                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_ablation_edges = use_ablation_edges
+        self.readout = readout
 
         self.building_type_embed = CategoricalEmbedder(building_type_vocab, building_type_embed_dim)
         # ONE shared highway embedding table — reused for the incident node's
@@ -285,6 +378,14 @@ class TVGEncoder(nn.Module):
         self.dropout = dropout
         self._edge_types = edge_types
 
+        if readout == "dgcnn":
+            assert dgcnn_k is not None, "TVGEncoder: dgcnn_k is required when readout='dgcnn'"
+            dgcnn_node_types = TVG_NODE_TYPES if use_ablation_edges else \
+                [nt for nt in TVG_NODE_TYPES if nt != "peer_incident"]
+            self.dgcnn = DGCNNReadout(dgcnn_node_types, hidden_dim, num_layers, dgcnn_k,
+                                       conv1_out=dgcnn_conv1_out, conv2_out=dgcnn_conv2_out,
+                                       conv2_kernel=dgcnn_conv2_kernel, out_dim=dgcnn_out_dim)
+
     def assemble_inputs(self, data):
         hw_idx = data["incident"].highway_type_idx
         hw_emb = self.highway_embed(hw_idx)
@@ -327,15 +428,23 @@ class TVGEncoder(nn.Module):
         edge_index_dict = {k: data[k].edge_index for k in self._edge_types}
         edge_attr_dict = self.assemble_edge_attrs(data)
 
+        x_dicts_per_layer = [x_dict] if self.readout == "dgcnn" else None
+
         for conv, norm in zip(self.convs, self.norms):
             x_dict = conv(x_dict, edge_index_dict, edge_attr_dict)
             x_dict = {nt: F.dropout(F.elu(norm[nt](x)), p=self.dropout, training=self.training)
                        for nt, x in x_dict.items()}
+            if x_dicts_per_layer is not None:
+                x_dicts_per_layer.append(x_dict)
 
+        if self.readout == "dgcnn":
+            return self.dgcnn(x_dicts_per_layer, batch_dict, anchor_type="incident")
         return _pool_and_anchor(x_dict, batch_dict, anchor_type="incident")
 
     @property
     def out_dim(self):
+        if self.readout == "dgcnn":
+            return self.dgcnn.out_dim_
         return self.hidden_dim * 2
 
 
@@ -488,11 +597,13 @@ class UnifiedEncoder(nn.Module):
                  building_type_vocab=58, highway_vocab=13,
                  building_type_embed_dim=8, highway_embed_dim=4,
                  continuous_missing_dim=4, use_ablation_edges=False,
-                 conv_type="gatv2"):
+                 conv_type="gatv2", readout="pool_anchor", dgcnn_k=None,
+                 dgcnn_conv1_out=16, dgcnn_conv2_out=32, dgcnn_conv2_kernel=5, dgcnn_out_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_ablation_edges = use_ablation_edges
         self.conv_type = conv_type
+        self.readout = readout
 
         # SVG-side embedders/projections — same shapes as SVGEncoder, own
         # weights (never shared with a standalone SVGEncoder instance).
@@ -558,6 +669,12 @@ class UnifiedEncoder(nn.Module):
         self._edge_types = edge_types
         self._node_types = node_types
 
+        if readout == "dgcnn":
+            assert dgcnn_k is not None, "UnifiedEncoder: dgcnn_k is required when readout='dgcnn'"
+            self.dgcnn = DGCNNReadout(node_types, hidden_dim, num_layers, dgcnn_k,
+                                       conv1_out=dgcnn_conv1_out, conv2_out=dgcnn_conv2_out,
+                                       conv2_kernel=dgcnn_conv2_kernel, out_dim=dgcnn_out_dim)
+
     def assemble_inputs(self, data):
         x_dict = {"ego": data["ego"].x}
         for nt, embedder in [("signage", self.signage_embed), ("light_pole", self.light_pole_embed),
@@ -613,15 +730,23 @@ class UnifiedEncoder(nn.Module):
         edge_index_dict = {k: data[k].edge_index for k in self._edge_types}
         edge_attr_dict = self.assemble_edge_attrs(data)
 
+        x_dicts_per_layer = [x_dict] if self.readout == "dgcnn" else None
+
         for conv, norm in zip(self.convs, self.norms):
             x_dict = conv(x_dict, edge_index_dict, edge_attr_dict)
             x_dict = {nt: F.dropout(F.elu(norm[nt](x)), p=self.dropout, training=self.training)
                        for nt, x in x_dict.items()}
+            if x_dicts_per_layer is not None:
+                x_dicts_per_layer.append(x_dict)
 
+        if self.readout == "dgcnn":
+            return self.dgcnn(x_dicts_per_layer, batch_dict, anchor_type="incident")
         return _pool_and_anchor(x_dict, batch_dict, anchor_type="incident")
 
     @property
     def out_dim(self):
+        if self.readout == "dgcnn":
+            return self.dgcnn.out_dim_
         return self.hidden_dim * 2
 
 
@@ -640,7 +765,7 @@ class ScenarioUnifiedGraph(nn.Module):
 
 
 def build_model(scenario, fusion_dim=64, head_depth="linear", head_hidden=32, head_dropout=0.35,
-                 use_ablation=False, svg_kwargs=None, tvg_kwargs=None):
+                 use_ablation=False, svg_kwargs=None, tvg_kwargs=None, unified_dgcnn_k=None):
     svg_kwargs = svg_kwargs or {}
     tvg_kwargs = dict(tvg_kwargs or {})
     tvg_kwargs["use_ablation_edges"] = use_ablation
@@ -668,6 +793,12 @@ def build_model(scenario, fusion_dim=64, head_depth="linear", head_hidden=32, he
         # tvg_kwargs above, so it flows through via **tvg_kwargs here too.
         unified_kwargs = {**tvg_kwargs, **svg_kwargs}
         unified_kwargs["use_ablation_edges"] = use_ablation
+        # svg_kwargs silently wins the merge above on shared key names --
+        # dgcnn_k must NOT inherit SVG's value here, since Unified's graph
+        # scale (10 node types, SVG+TVG combined) needs its own k. Same
+        # force-set pattern as use_ablation_edges just above.
+        if unified_dgcnn_k is not None:
+            unified_kwargs["dgcnn_k"] = unified_dgcnn_k
         unified_enc = UnifiedEncoder(**unified_kwargs)
         return ScenarioUnifiedGraph(unified_enc, fusion_dim, head_depth, head_hidden, head_dropout)
     raise ValueError(f"Unknown scenario: {scenario} (G is XGBoost — see baseline_features.py, no torch model)")

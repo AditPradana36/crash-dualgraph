@@ -165,7 +165,10 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
 
     model = models.build_model(scenario, fusion_dim=config.get("fusion_dim", 128), head_depth=head_depth,
                                 head_hidden=config.get("head_hidden", 32), head_dropout=config.get("head_dropout", 0.35),
-                                use_ablation=use_ablation, svg_kwargs=svg_kwargs, tvg_kwargs=tvg_kwargs).to(device)
+                                use_ablation=use_ablation, svg_kwargs=svg_kwargs, tvg_kwargs=tvg_kwargs,
+                                # only relevant when svg_kwargs/tvg_kwargs set readout="dgcnn" (see
+                                # build_model's own docstring comment) -- None elsewhere, no-op.
+                                unified_dgcnn_k=config.get("unified_dgcnn_k")).to(device)
     optimizer = AdamW(model.parameters(), lr=config.get("lr", 5e-3), weight_decay=config.get("weight_decay", 1e-4))
     scheduler = ReduceLROnPlateau(optimizer, mode="max", patience=config.get("lr_patience", 5), factor=0.5)
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -182,6 +185,12 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
 
     svg_nt = models.SVG_NODE_TYPES
     tvg_nt = models.TVG_NODE_TYPES if use_ablation else [nt for nt in models.TVG_NODE_TYPES if nt != "peer_incident"]
+
+    # Model-selection metric -- defaults to PR-AUC (today's behavior for
+    # every existing 07/07b/.../07h notebook, unaffected unless a config
+    # explicitly sets this). 07i (DGCNN comparison) sets this to
+    # "accuracy" via eval_dgcnn_comparison.yaml.
+    PRIMARY_METRIC = config.get("primary_metric", "pr_auc")
 
     best_val_prauc, best_state, no_improve = -1.0, None, 0
     best_train_loss, best_val_loss = None, None
@@ -224,9 +233,9 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
                                               is_cuda=is_cuda, use_amp=use_amp)
         val_metrics = ev.compute_metrics(val_true, val_prob)
         if epoch >= warmup_epochs:
-            scheduler.step(val_metrics["pr_auc"])
+            scheduler.step(val_metrics[PRIMARY_METRIC])
 
-        improved = val_metrics["pr_auc"] > best_val_prauc
+        improved = val_metrics[PRIMARY_METRIC] > best_val_prauc
         history.append({"epoch": epoch, "train_loss": train_loss,
                          "val_pr_auc": val_metrics["pr_auc"], "val_auroc": val_metrics.get("auroc"),
                          "lr": optimizer.param_groups[0]["lr"], "improved": improved})
@@ -241,7 +250,7 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
                   f"| lr={optimizer.param_groups[0]['lr']:.2e}{'  <- best' if improved else ''}")
 
         if improved:
-            best_val_prauc = val_metrics["pr_auc"]
+            best_val_prauc = val_metrics[PRIMARY_METRIC]
             best_state = copy.deepcopy(model.state_dict())
             no_improve = 0
             best_train_loss = train_loss
@@ -291,7 +300,10 @@ def train_one_fold(scenario, head_depth, use_ablation, train_items, val_items, t
     # val_pr_auc is what model/checkpoint selection should use (see
     # run_scenario) -- surfaced here rather than changing the return
     # signature, since it's the metric that picked best_state in the
-    # first place.
+    # first place. NOTE: despite the key name, this holds "best val score
+    # by whichever metric PRIMARY_METRIC names" -- historically always
+    # PR-AUC (hence the name), but e.g. 07i sets primary_metric="accuracy",
+    # in which case this key holds an accuracy value, not PR-AUC.
     test_metrics["val_pr_auc"] = best_val_prauc
 
     if history_path is not None:

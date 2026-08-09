@@ -1,0 +1,65 @@
+# Model config for the Deep Graph CNN (DGCNN / SortPooling, Zhang et al.
+# 2018) readout comparison experiment (07i_train_eval_dgcnn.ipynb).
+# Same capacity baseline as model_capacity_revision.yaml (07g) /
+# model_gin_comparison.yaml (07h) -- conv_type stays "gatv2" (unchanged),
+# so readout is the ONLY conv/architecture variable vs. 07g. NOTE: unlike
+# 07h, this experiment's EVAL config also differs from 07g's
+# (epoch_cap/primary_metric -- see eval_dgcnn_comparison.yaml), so the
+# 07i-vs-07g comparison is not a clean single-variable swap; see that
+# config's header and 07i's own markdown for the full list of deviations.
+#
+# readout: dgcnn -- swaps _pool_and_anchor for DGCNNReadout (SortPooling)
+# in SVGEncoder/TVGEncoder/UnifiedEncoder. See src/models.py's
+# DGCNNReadout docstring for the mechanism.
+#
+# svg_dgcnn_k / tvg_dgcnn_k / unified_dgcnn_k: PLACEHOLDERS ONLY --
+# superseded by 07i's diagnostic cell, which computes each encoder's real
+# per-graph total-node-count distribution and applies the paper's own
+# rule (Zhang et al. 2018, Sec 4.2): k = 40th percentile of that
+# distribution, floored at whatever the paired conv2_kernel requires
+# (k >= (conv2_kernel-1)*2+2 -- see DGCNNReadout's __init__ assert).
+# These placeholders are only used if that diagnostic cell is skipped,
+# which it shouldn't be.
+#
+# svg/unified_dgcnn_conv2_kernel: 5 (paper default, floor k>=10).
+# tvg_dgcnn_conv2_kernel: 3 (relaxed from the paper default -- TVG's real
+# mean total node count is ~8.1, below the k>=10 floor a kernel=5 second
+# conv would impose; kernel=3 drops the floor to k>=6, matching TVG's
+# actual scale). This is a deliberate, TVG-specific deviation, not an
+# oversight -- see DGCNNReadout / 07i's markdown for the full reasoning,
+# including why TVG's chosen k may not follow the 40th-percentile rule as
+# closely as SVG's/Unified's will (the floor, not the percentile, likely
+# wins for TVG).
+hidden_dim: 128
+fusion_dim: 256
+head_hidden: 256
+head_dropout: 0.3
+heads: 4
+svg_layers: 2
+tvg_layers: 2
+dropout: 0.3
+cat_embed_dim: 4
+building_type_embed_dim: 16
+highway_embed_dim: 8
+head_depth: mlp2
+conv_type: gatv2
+readout: dgcnn
+svg_dgcnn_k: 20          # placeholder -- superseded by 07i's diagnostic cell
+tvg_dgcnn_k: 8           # placeholder -- superseded by 07i's diagnostic cell
+unified_dgcnn_k: 30      # placeholder -- superseded by 07i's diagnostic cell
+svg_dgcnn_conv2_kernel: 5
+tvg_dgcnn_conv2_kernel: 3
+unified_dgcnn_conv2_kernel: 5
+scenarios:
+- A
+- B
+- C
+- D
+- E
+- F
+ablation_scope:
+- B
+- C
+- D
+- E
+- F

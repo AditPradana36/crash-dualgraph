@@ -1,0 +1,62 @@
+# Eval config for the DGCNN (SortPooling) readout comparison experiment
+# (07i_train_eval_dgcnn.ipynb). Copy of eval_capacity_revision.yaml (07g)
+# EXCEPT for three deliberate deviations, all per explicit instruction
+# for this experiment specifically -- everything else (split scheme,
+# lr/weight_decay/batch_size, threshold_method) stays comparable to
+# 07g/07h:
+#
+#   1. epoch_cap: 100 (was 150) -- fixed, controlled training budget so
+#      duration isn't a confound when comparing DGCNN's readout against
+#      07g's GATv2+pool_anchor baseline.
+#   2. primary_metric: accuracy (new key -- every other eval config omits
+#      it, so train.py's PRIMARY_METRIC defaults to "pr_auc" everywhere
+#      else). Accuracy drives checkpoint selection / early-stopping / the
+#      LR scheduler for this experiment only.
+#   3. patience/warmup_epochs set so early stopping structurally CANNOT
+#      fire before the full 100-epoch budget is used -- "epoch strictly
+#      at 100" means every scenario/repeat trains for exactly 100 epochs,
+#      not "at most 100". patience=100 (>= epoch_cap) and warmup_epochs=0
+#      together guarantee this (no_improve can reach at most epoch_cap-1
+#      before the loop's range() is naturally exhausted).
+#
+# CONSEQUENCE (flagged here and in 07i's own markdown): the 07i-vs-07g
+# comparison therefore changes THREE variables at once (readout, epoch
+# budget, selection metric) -- not a clean single-variable ablation the
+# way 07h (GIN) vs 07g was. Read 07i's final comparison numbers with that
+# in mind.
+n_repeats: 5
+val_frac: 0.15
+test_frac: 0.15
+
+label_col: label
+target_pos_frac: null
+
+warmup_epochs: 0
+epoch_cap: 100
+patience: 100
+lr_patience: 8
+
+primary_metric: accuracy
+
+# Fixed threshold -- same reasoning as 07g: this run isolates the
+# readout/epoch-budget/selection-metric variables, not threshold policy.
+threshold_method: fixed
+
+batch_size: 128
+lr: 0.005
+weight_decay: 0.0001
+num_workers: 0
+use_amp: true
+metrics_descriptive_only:
+- pr_auc
+- auroc
+- f1
+- precision
+- recall
+- accuracy
+- bce_loss
+- threshold_used
+- threshold_method
+interpretability_methods:
+- attention_weights
+- gnnexplainer
