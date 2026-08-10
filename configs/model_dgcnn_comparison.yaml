@@ -42,7 +42,15 @@ svg_layers: 2
 tvg_layers: 2
 dropout: 0.3
 cat_embed_dim: 4
-building_type_embed_dim: 16
+# building_type_embed_dim: bumped 16 -> 32. The REAL pooled building_type
+# vocab (post-04b, across all 4 cities) is 229 raw OSM `building=*` values,
+# not the ~58 originally assumed, and visibly noisy (near-duplicate typos,
+# free-text/place-name leakage). 04b now buckets rare categories (below a
+# pooled-frequency threshold) into a shared "other" category (distinct
+# from "unknown" = no tag at all) before the vocab reaches this embedding
+# table -- see model_capacity_revision.yaml's matching comment and
+# 04b_vocab_unification.ipynb's bucketing cell for the full reasoning.
+building_type_embed_dim: 32
 highway_embed_dim: 8
 head_depth: mlp2
 conv_type: gatv2

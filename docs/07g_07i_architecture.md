@@ -142,17 +142,17 @@ only by the `readout`-specific keys `07i` needs):
 |---|---|
 | `hidden_dim` | 128 |
 | `fusion_dim` | 256 |
-| `head_hidden` / `head_dropout` | 256 / 0.3 |
+| `head_hidden` / `head_dropout` | 256 / 0.5 |
 | encoder `dropout` | 0.3 |
 | `svg_layers` / `tvg_layers` | 2 / 2 |
-| `cat_embed_dim` / `building_type_embed_dim` / `highway_embed_dim` | 4 / 16 / 8 |
+| `cat_embed_dim` / `building_type_embed_dim` / `highway_embed_dim` | 4 / 32 / 8 (`building_type_embed_dim` bumped from 16 -- the real pooled `building_type` vocab is 229 raw OSM categories, noisy with near-duplicate typos and free-text/place-name leakage; `04b_vocab_unification.ipynb` now buckets rare categories into a shared `"other"` before this table's embedding is even sized) |
 | `head_depth` | `mlp2` (fixed, not swept) |
 | `conv_type` | `gatv2` (both branches — unchanged) |
-| split | 70/15/15, plain random, stratified by `label` only |
-| **`epoch_cap`** | **150, strictly** — `patience=150 ≥ epoch_cap` structurally prevents early stopping from firing within the loop; every repeat trains the full 150 epochs, not "at most 150" |
-| `warmup_epochs` | 20 |
+| split | 75/15/10, plain random, stratified by `label` only |
+| **`epoch_cap`** | **100, strictly** — `patience=100 ≥ epoch_cap` structurally prevents early stopping from firing within the loop; every repeat trains the full 100 epochs, not "at most 100" |
+| `warmup_epochs` | 0 |
 | **`primary_metric`** | **`accuracy`** (`train.py`'s own default now — inherited, not set explicitly in either config) — drives checkpoint selection, the `ReduceLROnPlateau` scheduler, and early-stop comparisons |
-| optimizer | AdamW, lr $5\times10^{-3}$, weight decay $1\times10^{-4}$ |
+| optimizer | AdamW, lr $1\times10^{-3}$, weight decay $1\times10^{-3}$, `lr_patience`=3 (hardcoded in each notebook's config cell, not config-file-driven) |
 | loss | `BCEWithLogitsLoss` (numerically-stable logit-space binary cross-entropy) |
 | threshold | fixed at 0.5 |
 | `n_repeats` | 5 (`run_scenario_random_repeats`, plain random re-splits) |

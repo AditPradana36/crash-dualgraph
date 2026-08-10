@@ -22,8 +22,19 @@
 #   own config-setup cell for the value actually in effect.
 # - categorical embedding dims doubled (cat_embed_dim, building_type_embed_dim,
 #   highway_embed_dim) -- still small relative to hidden_dim, but the old
-#   values (2/8/4) were tight even for the largest vocab (building_type,
-#   58+ categories post-04b unification).
+#   values (2/8/4) were tight even for the largest vocab. building_type_embed_dim
+#   was later bumped again, 16 -> 32: the REAL pooled building_type vocab
+#   (post-04b, across all 4 cities) is 229 raw OSM `building=*` values, not
+#   the ~58 originally assumed -- and visibly noisy (near-duplicate typos,
+#   free-text/place-name leakage). 04b now buckets any category with pooled
+#   frequency below a threshold into a shared "other" category (distinct
+#   from "unknown", which means no building tag at all) before the vocab
+#   ever reaches this embedding table -- see 04b_vocab_unification.ipynb's
+#   bucketing cell. 32 is checked against two standard heuristics for the
+#   pre-bucketing 229 count: entity-embedding cap (min(50,(vocab+1)//2))
+#   saturates at 50; fastai rule (round(1.6*vocab**0.56)) gives ~34 -- 32
+#   sits just under that. The REAL post-bucketing vocab will be smaller;
+#   revisit only if it comes out much smaller than expected (e.g. < 40).
 # - encoder depth (svg_layers/tvg_layers) left at 2 -- these are small
 #   graphs (README: "GPU recommended, not required"); more message-passing
 #   layers risks over-smoothing rather than fixing a real bottleneck, so
@@ -41,7 +52,7 @@ svg_layers: 2
 tvg_layers: 2
 dropout: 0.3
 cat_embed_dim: 4
-building_type_embed_dim: 16
+building_type_embed_dim: 32
 highway_embed_dim: 8
 head_depth: mlp2
 scenarios:
