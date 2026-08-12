@@ -349,3 +349,66 @@ def aggregate_explanations(records):
                              "n": alpha_per_edge.numel()})
 
     return pd.DataFrame(rows)
+
+
+def build_type_importance_report(explain_df, top_n=5):
+    """Summarizes aggregate_explanations' per-point output into a
+    per-scheme (scenario) x per-type report -- averaged across every
+    explained point, so scenarios/branches become directly comparable
+    ("does C_svg lean on signage more than A does") instead of only
+    being readable one point at a time.
+
+    All 'attention_layerN' sources are folded into one 'attention'
+    source first (mean across whatever layers that point/type has),
+    so the two importance signals -- GNNExplainer's learned mask vs.
+    GATv2's raw attention -- line up as exactly two comparable columns
+    rather than one column per layer.
+
+    Returns (pivot_df, topn_df):
+      pivot_df: one row per (scenario, kind, type), columns
+        'gnnexplainer' / 'attention' (mean importance across all
+        explained points that had that type present; NaN where a
+        source has no rows for that type), plus 'n_points'.
+      topn_df: for each (scenario, source), the top_n types by mean
+        importance, ranked -- columns scenario, source, rank, kind,
+        type, mean_importance.
+    """
+    import pandas as pd
+
+    if explain_df.empty:
+        empty_pivot = pd.DataFrame(columns=["scenario", "kind", "type", "gnnexplainer", "attention", "n_points"])
+        empty_topn = pd.DataFrame(columns=["scenario", "source", "rank", "kind", "type", "mean_importance"])
+        return empty_pivot, empty_topn
+
+    df = explain_df.copy()
+    df["source"] = df["source"].apply(lambda s: "attention" if s.startswith("attention_layer") else s)
+
+    grouped = (
+        df.groupby(["scenario", "kind", "type", "source"])
+        .agg(mean_importance=("mean_value", "mean"), n_points=("point_id", "nunique"))
+        .reset_index()
+    )
+
+    pivot_df = grouped.pivot_table(
+        index=["scenario", "kind", "type"], columns="source",
+        values="mean_importance", aggfunc="mean",
+    ).reset_index()
+    n_points_df = grouped.groupby(["scenario", "kind", "type"])["n_points"].max().reset_index()
+    pivot_df = pivot_df.merge(n_points_df, on=["scenario", "kind", "type"], how="left")
+    for col in ("gnnexplainer", "attention"):
+        if col not in pivot_df.columns:
+            pivot_df[col] = float("nan")
+    pivot_df = pivot_df[["scenario", "kind", "type", "gnnexplainer", "attention", "n_points"]]
+    pivot_df = pivot_df.sort_values(["scenario", "kind", "gnnexplainer"], ascending=[True, True, False])
+
+    topn_rows = []
+    for (scenario, source), sub in grouped.groupby(["scenario", "source"]):
+        ranked = sub.sort_values("mean_importance", ascending=False).head(top_n)
+        for rank, row in enumerate(ranked.itertuples(index=False), start=1):
+            topn_rows.append({
+                "scenario": scenario, "source": source, "rank": rank,
+                "kind": row.kind, "type": row.type, "mean_importance": row.mean_importance,
+            })
+    topn_df = pd.DataFrame(topn_rows)
+
+    return pivot_df, topn_df
