@@ -309,7 +309,13 @@ class SVGEncoder(nn.Module):
             raise ValueError(f"SVGEncoder: unknown readout {readout!r} "
                               f"(expected 'pool_anchor', 'dgcnn', or 'global_pool')")
 
-    def assemble_inputs(self, data):
+    def _assemble_raw_features(self, data):
+        """Per-node-type concatenated feature vector BEFORE input_proj --
+        factored out of assemble_inputs so explain.py's feature-level
+        GNNExplainer (run_gnnexplainer_features) can mask individual
+        named components (position, area, class embedding, ...) rather
+        than only the post-projection hidden_dim vector. Component
+        order/widths documented in explain.py's get_feature_components()."""
         x_dict = {"ego": data["ego"].x}
 
         for nt, embedder in [("signage", self.signage_embed), ("light_pole", self.light_pole_embed),
@@ -324,6 +330,10 @@ class SVGEncoder(nn.Module):
         for nt in ["building", "vegetation"]:
             x_dict[nt] = torch.cat([data[nt].x, data[nt].area_norm], dim=1)
 
+        return x_dict
+
+    def assemble_inputs(self, data):
+        x_dict = self._assemble_raw_features(data)
         return {nt: self.input_proj[nt](x) for nt, x in x_dict.items()}
 
     def forward(self, data, batch_dict=None):
@@ -451,7 +461,10 @@ class TVGEncoder(nn.Module):
             raise ValueError(f"TVGEncoder: unknown readout {readout!r} "
                               f"(expected 'pool_anchor', 'dgcnn', or 'global_pool')")
 
-    def assemble_inputs(self, data):
+    def _assemble_raw_features(self, data):
+        """Per-node-type concatenated feature vector BEFORE input_proj --
+        see SVGEncoder._assemble_raw_features for why this is factored
+        out (feature-level GNNExplainer masking)."""
         hw_idx = data["incident"].highway_type_idx
         hw_emb = self.highway_embed(hw_idx)
         incident_x = torch.cat([data["incident"].x, hw_emb], dim=1)
@@ -474,6 +487,10 @@ class TVGEncoder(nn.Module):
         if self.use_ablation_edges:
             x_dict["peer_incident"] = data["peer_incident"].x
 
+        return x_dict
+
+    def assemble_inputs(self, data):
+        x_dict = self._assemble_raw_features(data)
         return {nt: self.input_proj[nt](x) for nt, x in x_dict.items()}
 
     def assemble_edge_attrs(self, data):
@@ -750,7 +767,10 @@ class UnifiedEncoder(nn.Module):
             raise ValueError(f"UnifiedEncoder: unknown readout {readout!r} "
                               f"(expected 'pool_anchor', 'dgcnn', or 'global_pool')")
 
-    def assemble_inputs(self, data):
+    def _assemble_raw_features(self, data):
+        """Per-node-type concatenated feature vector BEFORE input_proj --
+        see SVGEncoder._assemble_raw_features for why this is factored
+        out (feature-level GNNExplainer masking)."""
         x_dict = {"ego": data["ego"].x}
         for nt, embedder in [("signage", self.signage_embed), ("light_pole", self.light_pole_embed),
                               ("road_marking", self.road_marking_embed)]:
@@ -781,6 +801,10 @@ class UnifiedEncoder(nn.Module):
         if self.use_ablation_edges:
             x_dict["peer_incident"] = data["peer_incident"].x
 
+        return x_dict
+
+    def assemble_inputs(self, data):
+        x_dict = self._assemble_raw_features(data)
         return {nt: self.input_proj[nt](x) for nt, x in x_dict.items()}
 
     def assemble_edge_attrs(self, data):

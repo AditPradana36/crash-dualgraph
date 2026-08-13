@@ -412,3 +412,295 @@ def build_type_importance_report(explain_df, top_n=5):
     topn_df = pd.DataFrame(topn_rows)
 
     return pivot_df, topn_df
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Feature-level explanation (v2) -- masks individual NAMED FEATURE
+# COMPONENTS (position, area, class embedding, building height, ...)
+# per node, instead of one scalar per node. Requires each encoder's
+# _assemble_raw_features(data) hook (src/models.py) -- the raw,
+# pre-input_proj concatenated feature vector per node type.
+# ─────────────────────────────────────────────────────────────────────────
+
+def get_feature_components(encoder, node_type):
+    """Named (component_name, width) segments describing node_type's raw
+    feature vector BEFORE input_proj, in the exact concatenation order
+    encoder._assemble_raw_features uses. Widths are read from the
+    encoder's own embedding/projection modules (not hardcoded), so this
+    stays correct if cat_embed_dim / building_type_embed_dim / etc change.
+
+    Granularity: every continuous raw field gets its own named slot; a
+    categorical field's embedding block is ONE named component -- masking
+    individual embedding dimensions isn't semantically interpretable,
+    only "was this categorical field used at all" is.
+
+    Note: SVGEncoder's "building" (pos+area, 3 dims) and TVGEncoder's
+    "building" (6 geometric fields + type/height/levels, richer) share a
+    name but are NOT the same schema -- distinguished here by whether
+    `encoder` has a `building_type_embed` attribute (TVG/Unified only).
+    Always call this with the SAME encoder instance the data belongs to."""
+    if node_type == "ego":
+        return [("svf", 1), ("enclosure", 1), ("entropy", 1), ("pos_x", 1), ("pos_y", 1)]
+    if node_type in ("signage", "light_pole", "road_marking"):
+        embedder = {"signage": encoder.signage_embed, "light_pole": encoder.light_pole_embed,
+                    "road_marking": encoder.road_marking_embed}[node_type]
+        return [("pos_x", 1), ("pos_y", 1), ("area_norm", 1),
+                ("class_embed", embedder.embed.embedding_dim)]
+    if node_type == "incident":
+        return [("fraction_along", 1), ("isovist_area", 1), ("isovist_compactness", 1),
+                ("isovist_occlusivity", 1), ("highway_embed", encoder.highway_embed.embed.embedding_dim)]
+    if node_type in ("building", "tvg_building") and hasattr(encoder, "building_type_embed"):
+        return [("area", 1), ("perimeter", 1), ("circular_compactness", 1), ("elongation", 1),
+                ("orientation", 1), ("shape_index", 1),
+                ("type_embed", encoder.building_type_embed.embed.embedding_dim),
+                ("height_feat", encoder.height_module.proj.out_features),
+                ("levels_feat", encoder.levels_module.proj.out_features)]
+    if node_type in ("building", "svg_building", "vegetation"):
+        return [("pos_x", 1), ("pos_y", 1), ("area_norm", 1)]
+    if node_type == "intersection":
+        return [("betweenness", 1), ("orientation_entropy", 1)]
+    if node_type == "peer_incident":
+        return [("constant_placeholder", 1)]
+    raise ValueError(f"get_feature_components: unknown node_type {node_type!r}")
+
+
+def run_gnnexplainer_features(encoder, data, predict_fn, epochs=100, lr=0.05,
+                               edge_size_coef=0.005, feature_size_coef=0.005,
+                               entropy_coef=0.1, verbose=False):
+    """Feature-level variant of run_gnnexplainer: learns a soft mask per
+    NAMED FEATURE COMPONENT per node (see get_feature_components), not
+    one scalar per node. Hooks encoder._assemble_raw_features (the raw,
+    pre-input_proj feature vector) instead of assemble_inputs, so masking
+    lands on interpretable named fields (e.g. "is this building's HEIGHT
+    driving the prediction, or just its footprint AREA") rather than the
+    opaque post-projection hidden_dim embedding.
+
+    Edge masking is UNCHANGED from run_gnnexplainer (still one scalar per
+    edge, not per edge-attribute-dimension) -- true per-edge-attribute
+    feature masking would need an analogous raw/projected split inside
+    assemble_edge_attrs, out of scope here (see explain.py's module-level
+    notes / the conversation this was scoped in).
+
+    Returns (feature_mask_dict, edge_mask_dict, final_fidelity_loss):
+    feature_mask_dict[node_type] = {component_name: Tensor[n_nodes]},
+    detached, post-sigmoid [0, 1] importance per named component.
+    edge_mask_dict is {} for SVGEncoder (no edge hook), same as
+    run_gnnexplainer."""
+    encoder.eval()
+
+    base_raw_dict = encoder._assemble_raw_features(data)
+    has_edge_hook = hasattr(encoder, "assemble_edge_attrs")
+    base_edge_attr_dict = encoder.assemble_edge_attrs(data) if has_edge_hook else {}
+
+    device = next(iter(base_raw_dict.values())).device if base_raw_dict else torch.device("cpu")
+
+    components_by_type = {}
+    feature_mask_params = {}
+    for nt, raw in base_raw_dict.items():
+        if raw.shape[0] == 0:
+            continue
+        comps = get_feature_components(encoder, nt)
+        components_by_type[nt] = comps
+        feature_mask_params[nt] = nn.Parameter(torch.zeros(raw.shape[0], len(comps), device=device))
+
+    edge_mask_params = {}
+    if has_edge_hook:
+        for key, attr in base_edge_attr_dict.items():
+            if attr is None or attr.shape[0] == 0:
+                continue
+            edge_mask_params[key] = nn.Parameter(torch.zeros(attr.shape[0], device=device))
+
+    if not feature_mask_params and not edge_mask_params:
+        return {}, {}, float("nan")
+
+    with torch.no_grad():
+        original_logit = predict_fn(data).detach()
+        original_pred = (torch.sigmoid(original_logit) > 0.5).float()
+
+    optimizer = torch.optim.Adam(
+        list(feature_mask_params.values()) + list(edge_mask_params.values()), lr=lr)
+
+    orig_assemble_raw = encoder._assemble_raw_features
+    orig_assemble_edge_attrs = encoder.assemble_edge_attrs if has_edge_hook else None
+
+    def masked_assemble_raw(d):
+        raw_dict = orig_assemble_raw(d)
+        out = {}
+        for nt, raw in raw_dict.items():
+            if nt not in feature_mask_params:
+                out[nt] = raw
+                continue
+            mask = torch.sigmoid(feature_mask_params[nt])  # [n_nodes, n_components]
+            pieces = []
+            offset = 0
+            for c_idx, (_name, width) in enumerate(components_by_type[nt]):
+                pieces.append(raw[:, offset:offset + width] * mask[:, c_idx:c_idx + 1])
+                offset += width
+            out[nt] = torch.cat(pieces, dim=1)
+        return out
+
+    def masked_assemble_edge_attrs(d):
+        edge_attr_dict = orig_assemble_edge_attrs(d)
+        return {
+            key: (attr * torch.sigmoid(edge_mask_params[key]).unsqueeze(-1)
+                  if key in edge_mask_params and attr is not None and attr.shape[0] > 0 else attr)
+            for key, attr in edge_attr_dict.items()
+        }
+
+    final_fidelity = None
+    try:
+        encoder._assemble_raw_features = masked_assemble_raw
+        if has_edge_hook:
+            encoder.assemble_edge_attrs = masked_assemble_edge_attrs
+
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            masked_logit = predict_fn(data)
+            fidelity_loss = F.binary_cross_entropy_with_logits(masked_logit, original_pred)
+
+            feat_size_loss = sum((torch.sigmoid(p).sum() for p in feature_mask_params.values()),
+                                  torch.tensor(0.0, device=device))
+            edge_size_loss = sum((torch.sigmoid(p).sum() for p in edge_mask_params.values()),
+                                  torch.tensor(0.0, device=device))
+            all_params = list(feature_mask_params.values()) + list(edge_mask_params.values())
+            entropy_loss = sum(
+                (-torch.sigmoid(p) * torch.log(torch.sigmoid(p) + 1e-8)
+                 - (1 - torch.sigmoid(p)) * torch.log(1 - torch.sigmoid(p) + 1e-8)).mean()
+                for p in all_params
+            ) / max(len(all_params), 1)
+
+            loss = (fidelity_loss + feature_size_coef * feat_size_loss
+                    + edge_size_coef * edge_size_loss + entropy_coef * entropy_loss)
+            loss.backward()
+            optimizer.step()
+            final_fidelity = fidelity_loss.item()
+
+            if verbose and epochs >= 5 and epoch % (epochs // 5) == 0:
+                print(f"    gnnexplainer(features) epoch {epoch:3d} | fidelity_loss={fidelity_loss.item():.4f}")
+    finally:
+        encoder._assemble_raw_features = orig_assemble_raw
+        if has_edge_hook:
+            encoder.assemble_edge_attrs = orig_assemble_edge_attrs
+
+    feature_mask_dict = {
+        nt: {name: torch.sigmoid(feature_mask_params[nt][:, i]).detach().cpu()
+             for i, (name, _w) in enumerate(components_by_type[nt])}
+        for nt in feature_mask_params
+    }
+    edge_mask_dict = {key: torch.sigmoid(p).detach().cpu() for key, p in edge_mask_params.items()}
+    return feature_mask_dict, edge_mask_dict, final_fidelity
+
+
+def explain_scenario_point_features(model, scenario, svg_data, tvg_data, point_id, category=None,
+                                     gnnexplainer_epochs=100, gnnexplainer_lr=0.05):
+    """Feature-level counterpart to explain_scenario_point -- same
+    per-scenario branch structure (single-encoder A/B/F vs. dual-encoder
+    C/D/E), but calls run_gnnexplainer_features instead of
+    run_gnnexplainer, so node importance comes back broken down by named
+    feature component rather than one scalar per node. Attention is NOT
+    re-extracted here (see explain_scenario_point/extract_attention_weights
+    for that) -- this function is scoped to feature-level GNNExplainer
+    masks only, meant to run ALONGSIDE explain_scenario_point's output,
+    not replace it.
+
+    Returns a list of record dicts (see aggregate_feature_explanations),
+    one per explained branch: 1 for A/B/F, 2 for C/D/E."""
+    import unified_graph as ug
+
+    records = []
+
+    def _record(sub_scenario, encoder, data, predict_fn):
+        rec = {"point_id": point_id, "category": category, "scenario": sub_scenario}
+        feature_mask, edge_mask, _fidelity = run_gnnexplainer_features(
+            encoder, data, predict_fn, epochs=gnnexplainer_epochs, lr=gnnexplainer_lr)
+        rec["feature_mask"] = feature_mask
+        rec["edge_mask"] = edge_mask
+        records.append(rec)
+
+    if scenario == "A":
+        _record("A", model.encoder, svg_data, lambda d: model(d))
+    elif scenario == "B":
+        _record("B", model.encoder, tvg_data, lambda d: model(d))
+    elif scenario == "F":
+        merged = ug.merge_svg_tvg(svg_data, tvg_data)
+        _record("F", model.encoder, merged, lambda d: model(d))
+    elif scenario in ("C", "D", "E"):
+        _record(f"{scenario}_svg", model.svg_encoder, svg_data,
+                 lambda d: model(d, tvg_data, None, None))
+        _record(f"{scenario}_tvg", model.tvg_encoder, tvg_data,
+                 lambda d: model(svg_data, d, None, None))
+    else:
+        raise ValueError(
+            f"explain_scenario_point_features: unsupported scenario {scenario!r} -- "
+            f"G has no GNN encoder; pass an ablation's base letter (e.g. 'B' "
+            f"for 'B_ablation'), not the '_ablation' suffix itself."
+        )
+
+    return records
+
+
+def aggregate_feature_explanations(records):
+    """Tidies run_gnnexplainer_features' output across many explained
+    points into ONE long-format pandas.DataFrame -- feature-level
+    counterpart to aggregate_explanations. Edge-mask rows are NOT
+    included (unchanged from aggregate_explanations' own edge rows --
+    avoid duplicating that report); this is scoped to per-node-type-
+    per-feature-component importance only.
+
+    records: list of dicts from explain_scenario_point_features:
+      {"point_id": str, "category": ..., "scenario": str,
+       "feature_mask": {node_type: {feature_name: Tensor}}, "edge_mask": ...}
+
+    Returns a DataFrame: point_id, category, scenario, node_type,
+    feature, mean_value, max_value, n -- one row per
+    (point, node_type, feature component)."""
+    import pandas as pd
+
+    rows = []
+    for rec in records:
+        pid, cat, scen = rec.get("point_id"), rec.get("category"), rec.get("scenario")
+        for nt, comp_masks in (rec.get("feature_mask") or {}).items():
+            for feat_name, mask in comp_masks.items():
+                if mask.numel() == 0:
+                    continue
+                rows.append({"point_id": pid, "category": cat, "scenario": scen,
+                             "node_type": nt, "feature": feat_name,
+                             "mean_value": mask.mean().item(), "max_value": mask.max().item(),
+                             "n": mask.numel()})
+    return pd.DataFrame(rows)
+
+
+def build_feature_importance_report(feature_df, top_n=5):
+    """Per-scheme (scenario) summary of aggregate_feature_explanations'
+    output, analogous to build_type_importance_report but for named
+    feature components instead of node/edge types.
+
+    Returns (pivot_df, topn_df):
+      pivot_df: one row per (scenario, node_type, feature), averaged
+        across every explained point -- columns scenario, node_type,
+        feature, mean_importance, n_points.
+      topn_df: top_n features by mean importance per scenario, ranked --
+        columns scenario, rank, node_type, feature, mean_importance."""
+    import pandas as pd
+
+    if feature_df.empty:
+        empty_pivot = pd.DataFrame(columns=["scenario", "node_type", "feature", "mean_importance", "n_points"])
+        empty_topn = pd.DataFrame(columns=["scenario", "rank", "node_type", "feature", "mean_importance"])
+        return empty_pivot, empty_topn
+
+    grouped = (
+        feature_df.groupby(["scenario", "node_type", "feature"])
+        .agg(mean_importance=("mean_value", "mean"), n_points=("point_id", "nunique"))
+        .reset_index()
+    )
+    pivot_df = grouped.sort_values(["scenario", "mean_importance"], ascending=[True, False])
+
+    topn_rows = []
+    for scenario, sub in grouped.groupby("scenario"):
+        ranked = sub.sort_values("mean_importance", ascending=False).head(top_n)
+        for rank, row in enumerate(ranked.itertuples(index=False), start=1):
+            topn_rows.append({"scenario": scenario, "rank": rank, "node_type": row.node_type,
+                              "feature": row.feature, "mean_importance": row.mean_importance})
+    topn_df = pd.DataFrame(topn_rows)
+
+    return pivot_df, topn_df
