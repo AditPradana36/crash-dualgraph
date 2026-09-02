@@ -1134,7 +1134,7 @@ as introduced in §2.3–2.4.
 | `MRK` | road_marking | Egocentric | |
 | `VEG` | vegetation | Egocentric | |
 | `BLD` | building | Egocentric **or** Allocentric | ambiguous alone — see below |
-| `BLD-S` | building (egocentric façade) | Egocentric v| only distinguished from `BLD-T` inside Scheme F's merged graph (§4.6); the two standalone graphs both just use `BLD` |
+| `BLD-S` | building (egocentric façade) | Egocentric | only distinguished from `BLD-T` inside Scheme F's merged graph (§4.6); the two standalone graphs both just use `BLD` |
 | `INC` | incident / focal | Allocentric | one per graph |
 | `INT` | intersection | Allocentric | |
 | `BLD-T` | building (allocentric footprint) | Allocentric | see `BLD-S` note |
@@ -1177,6 +1177,31 @@ as introduced in §2.3–2.4.
 `FP_AR` is an OSM footprint's physical area in the allocentric graph's
 metric CRS — a report or figure must disambiguate by which node code
 the value is attached to, never by the bare feature name alone.
+
+### 7.6 Standardized Reporting Format for Explanation Figures
+
+Every downstream table and figure built from §7.2–§7.5's output follows
+the same three conventions, so a reader moving between them never has
+to re-learn how a row or panel is scoped:
+
+1. **Branch-level rows for dual-graph schemes.** Because C, D, and E
+   explain each branch separately (§7.2), their rows are never merged
+   into one "scheme C" summary — they appear as two: *scheme —
+   street-view branch* and *scheme — top-view branch*. Single-graph
+   schemes (A, B) and the merged-graph scheme (F) need no such split
+   and appear as one row each.
+2. **Normal and ablation are two separate report sets, never mixed.**
+   Every table/figure is produced twice — once from schemes A–F (or
+   G) with `crash_history`/`peer_incident` absent, once from B+–F+
+   with it present (§4, §5) — labelled accordingly, so a reader is
+   never left guessing which setting a given row reflects.
+3. **Top-$N$ ranking (default $N=5$) is the standard summary view**,
+   at both granularities from §7.4: per scheme/branch, the $N$
+   highest mean-importance node/edge types (Option 1) or named
+   feature components (Option 2), ranked descending. This is the same
+   selection `build_type_importance_report`/`build_feature_importance_report`
+   already produce (§7.3) — the reporting layer only ever renders that
+   ranking, it does not recompute or re-threshold it.
 
 ---
 
