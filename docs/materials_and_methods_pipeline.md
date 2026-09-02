@@ -1,12 +1,9 @@
 # Materials and Methods: Dual-Graph Heterogeneous GNN Pipeline for Crash-Risk Prediction
 
-This document describes the full methodological pipeline — from raw
-graph construction through model architecture, training, evaluation,
-and post-hoc explanation — independent of any particular codebase's
-internal file or variable naming. It is written to be dropped directly
-into a Materials and Methods section. Every architectural choice below
-is stated with its concrete value as actually used in this study, not
-left as a free symbol.
+This section describes the dual-graph pipeline used to predict
+crash risk: graph construction, model architecture, training,
+evaluation, and post-hoc explanation. All architectural choices are
+reported with the concrete values used in this study.
 
 ---
 
@@ -23,112 +20,86 @@ complementary graph representations** of its surroundings:
   map-based view of the same location's surrounding built environment.
 
 The task is to learn $f: (G^{ego}_i, G^{allo}_i) \mapsto \hat{y}_i \in
-[0,1]$, and — beyond raw predictive performance — to establish *which*
-part of each graph the model actually relies on when it predicts.
+[0,1]$ and, beyond predictive performance, to establish which part of
+each graph the model relies on for its prediction.
 
 ---
 
 ## 2. Data Representation and Acquisition
 
-Both graphs are **heterogeneous**: they contain multiple node types
-$\mathcal{T}_{node}$ and multiple edge relations $\mathcal{R}$, each
-carrying its own feature schema and its own raw dimensionality, rather
-than a single homogeneous node/edge type shared by the whole graph.
-This section follows the pipeline in the order it actually runs: raw
-data first (§2.1), negative-point generation (§2.2), then each graph's
-own acquisition-to-construction path — egocentric via segmentation
-(§2.3), allocentric via OpenStreetMap (§2.4) — followed by two
-cross-cutting processing steps applied after both graphs exist
-(§2.5–2.6).
+Both graphs are **heterogeneous**, containing multiple node types
+$\mathcal{T}_{node}$ and edge relations $\mathcal{R}$, each with its
+own feature schema and raw dimensionality. This section follows the
+pipeline order: raw data (§2.1), negative-point generation (§2.2),
+each graph's acquisition-to-construction path — egocentric via
+segmentation (§2.3), allocentric via OpenStreetMap (§2.4) — and a
+cross-cutting preprocessing step (§2.5).
 
 ### 2.1 Raw Data
 
-Before any segmentation or graph construction happens, every candidate
-location $i$ starts as nothing more than **one street-level image and
+Every candidate location $i$ starts as **one street-level image and
 one geographic coordinate** — the same minimal starting point for both
 classes:
 
-- **Positive (crash) points** originate from recorded crash locations;
-  each is matched to a street-level image captured as close as
-  possible to the reported coordinate.
-- **Negative (non-crash) points** have no independent record of their
-  own — they must be deliberately generated to be geographically and
-  distributionally comparable to the positives, rather than sourced
-  from anywhere else (§2.2 covers exactly how).
+- **Positive (crash) points** originate from recorded crash locations,
+  each matched to a street-level image captured as close as possible
+  to the reported coordinate.
+- **Negative (non-crash) points** are deliberately generated to be
+  geographically and distributionally comparable to the positives
+  (§2.2), rather than sourced from any independent record.
 
-Street-level images for both classes are retrieved with
+Street-level images are retrieved with
 [`streetlevel`](https://github.com/sk-zk/streetlevel), an open-source
-package for querying and downloading street-level panorama imagery
-given a target coordinate — the acquisition-distance filter used later
-in negative sampling (§2.2, $\leq 10\,\text{m}$) is measured between
-the requested coordinate and the position actually returned by this
-retrieval step.
+package for querying street-level panorama imagery given a target
+coordinate. The acquisition-distance filter used in negative sampling
+(§2.2, $\leq 10\,\text{m}$) is measured between the requested
+coordinate and the position this retrieval step actually returns.
 
-Only once a point has both a coordinate and a successfully acquired
-image does it proceed to the two parallel construction pipelines: the
-egocentric graph, built from the image via segmentation (§2.3), and the
+Once a point has both a coordinate and a successfully acquired image,
+it proceeds to two parallel construction pipelines: the egocentric
+graph, built from the image via segmentation (§2.3), and the
 allocentric graph, built from the coordinate via OpenStreetMap (§2.4).
 
 ### 2.2 Negative (Non-Crash) Point Sampling
 
 Every positive (crash) location is paired with a comparably-sourced
-**negative** location — a point with no recorded crash — so the task
-is a genuine binary discrimination rather than a one-class density
-estimate. Negatives are *generated*, not drawn from any independent
-non-crash record, following six steps:
+**negative** location, so the task is genuine binary discrimination
+rather than one-class density estimation. Negatives are *generated*,
+not drawn from an independent record, in six steps:
 
-1. **Filter positives first.** Raw crash records are restricted to
-   those with a successfully acquired street-view image within a fixed
-   distance of the reported crash coordinate ($\leq 10\,\text{m}$
-   acquisition distance) — this filtered positive set is what steps 2–4
-   below are matched *against*, not the raw unfiltered record.
-2. **Snap each retained positive to the road network.** The study
-   area's drivable street network is fetched (constrained to the
-   study-area boundary polygon, so it can never extend outside it —
-   satisfying the geographic constraint directly, with no separate
-   spatial-filter step needed later), projected to a local metric CRS,
-   and every positive point is snapped to its nearest road edge, which
-   also records that edge's road-classification tag (e.g. `residential`,
-   `secondary`, `primary`...).
-3. **Compute the positive set's road-type distribution.** The
-   proportion of (now road-snapped) positives falling on each road
-   classification becomes the **target distribution** for negative
-   generation — e.g. if $30\%$ of positives snap to a `residential`
-   road, $30\%$ of generated negatives are targeted at `residential`
-   roads too.
-4. **Availability quality-check before generating.** For each road
-   type, the total available road length of that type is compared
-   against how many negatives it would need to supply; a type with too
-   little road length for its target count (implying negatives would
-   have to cluster within an unrealistically short spacing) is flagged
-   before generation proceeds, rather than silently producing
-   near-duplicate points.
-5. **Generate negatives by length-weighted sampling along matching
-   road segments.** For each road type, candidate points are drawn by
-   sampling edges of that type with probability proportional to each
-   edge's length (so a longer segment is proportionally more likely to
-   receive a point), then placing the point at a uniformly random
-   position along the chosen edge. A generated point is accepted only
-   if it falls **at least a minimum distance from every known positive
-   point** (a deliberate safeguard so a "negative" can never
-   coincidentally land on or immediately beside an actual crash
-   location); rejected candidates are simply re-sampled until each
-   road type's target count is met.
-6. **Balance the total count.** The total number of negatives targeted
-   equals the (filtered) positive count times a fixed ratio (used at
-   $1{:}1$ in this study), split across road types according to step 3's
-   distribution — so the *overall* class balance and the *per-road-type*
-   composition are matched simultaneously, not just one or the other.
+1. **Filter positives.** Raw crash records are restricted to those
+   with a street-view image within $\leq 10\,\text{m}$ of the reported
+   coordinate; this filtered set is the reference for steps 2–4.
+2. **Snap to the road network.** The study area's drivable street
+   network (constrained to the study-area boundary) is projected to a
+   local metric CRS; each retained positive is snapped to its nearest
+   road edge, recording that edge's road-classification tag (e.g.
+   `residential`, `secondary`, `primary`).
+3. **Compute the road-type distribution.** The proportion of
+   road-snapped positives on each classification becomes the
+   **target distribution** for negative generation (e.g. $30\%$
+   positives on `residential` $\to$ $30\%$ of negatives targeted there).
+4. **Availability check.** For each road type, available road length
+   is compared against the negatives it would need to supply; a type
+   with insufficient length to avoid unrealistic clustering is flagged
+   before generation.
+5. **Length-weighted sampling.** Candidate points are drawn per road
+   type by sampling edges with probability proportional to edge
+   length, then placed at a uniformly random position along the edge.
+   A candidate is accepted only if it is **at least a minimum distance
+   from every known positive**, so a negative can never coincide with
+   or sit immediately beside an actual crash; rejected candidates are
+   re-sampled until the target count is met.
+6. **Balance the total count.** Total negatives equal the filtered
+   positive count times a fixed ratio ($1{:}1$ in this study), split
+   across road types per step 3 — matching overall class balance and
+   per-road-type composition simultaneously.
 
-This road-type matching is a deliberate design decision, not
-incidental: without it, the model could trivially learn "this road
-classification alone predicts the label" as a shortcut confounded with
-sampling artifact, rather than genuinely learning from the surrounding
-visual/spatial evidence. Matching this one distribution up front closes
-off that shortcut before training ever begins. Quality control includes
+Road-type matching is deliberate: without it, the model could learn
+road classification as a shortcut confounded with sampling artifact
+rather than genuine visual/spatial evidence. Quality control includes
 a spatial kernel-density comparison of positive vs. generated-negative
-locations and a direct per-road-type proportion check confirming the
-generated set actually hit its targets.
+locations and a per-road-type proportion check against target.
 
 | Parameter | Value |
 |---|---|
@@ -187,12 +158,11 @@ rejection**, for one road type's edge set:
 </svg>
 </p>
 
-Once generated, a negative point is carried through **the exact same**
+Once generated, a negative point is carried through the same
 downstream pipeline as a positive point — image capture, metadata
-reconciliation, out-of-range filtering, egocentric/allocentric graph
-construction (§2.3–2.4) — with no label-dependent branching anywhere in
-that process, so the label itself never leaks into how a point's graph
-gets built.
+reconciliation, out-of-range filtering, graph construction (§2.3–2.4)
+— with no label-dependent branching, so the label never leaks into
+graph construction.
 
 ```mermaid
 flowchart TB
@@ -216,17 +186,15 @@ flowchart TB
 #### 2.3.1 Segmentation
 
 Object nodes are extracted via **panoptic segmentation** (Mask2Former,
-Swin-Large backbone, fine-tuned on the Mapillary Vistas v1.2
-taxonomy — 65 classes), run at each image's native resolution.
-Mapillary's classes split into "thing" classes (countable objects the
-model already instances individually — traffic lights, poles, signs,
-banners, billboards) and "stuff" classes (amorphous regions the model
-fuses into one segment per class — buildings, vegetation, crosswalks,
-lane markings); stuff segments are re-split into individual object
-nodes via connected-component labeling on their fused mask, so multiple
-buildings or a dashed lane marking in one frame become separate nodes
-rather than one blob. Detected regions below a minimum pixel-area
-threshold are discarded.
+Swin-Large backbone, fine-tuned on Mapillary Vistas v1.2 — 65 classes),
+run at native resolution. Mapillary classes split into "thing" classes
+(individually instanced — traffic lights, poles, signs, banners,
+billboards) and "stuff" classes (fused per-class regions — buildings,
+vegetation, crosswalks, lane markings); stuff segments are re-split
+into individual object nodes via connected-component labeling, so
+multiple buildings or a dashed lane marking become separate nodes
+rather than one blob. Detections below a minimum pixel-area threshold
+are discarded.
 
 | Node type | Source segmentation classes |
 |---|---|
@@ -247,12 +215,11 @@ $$
 \text{SVF} = \frac{\text{number of sky pixels}}{\text{total number of pixels in the image}}
 $$
 
-**Enclosure Index** — the same idea, but for a fixed set of
-"enclosure" classes (buildings, walls, fences, vegetation, and every
-pole/sign/light class — everything that can wall in a street), and
-counted only within the **top 40% of the image by height** rather than
-the whole frame, so it captures overhead/vertical enclosure instead of
-being diluted by an open road surface at the bottom:
+**Enclosure Index** — the same idea, over a fixed set of "enclosure"
+classes (buildings, walls, fences, vegetation, and every pole/sign/
+light class), counted only within the **top 40% of the image by
+height** rather than the whole frame, capturing overhead/vertical
+enclosure without dilution from the open road surface below:
 
 $$
 \text{Enclosure} = \frac{\text{number of enclosure-class pixels in the top 40\% crop}}{\text{total number of pixels in that top 40\% crop}}
@@ -272,47 +239,49 @@ $$
 \text{Entropy} = -\sum_{c} p_c \log p_c
 $$
 
-A frame dominated by one or two classes (e.g. mostly road and sky) has
-low entropy; a visually cluttered frame spread across many classes has
-high entropy. This is entropy over *pixel proportion per class*, not
-over individual object instances — ten small signage instances
-contribute to the same $p_c$ as one large one, since what's being
-measured is how visually "busy" the frame is, not how many discrete
-objects are in it.
+A frame dominated by one or two classes (e.g. road and sky) has low
+entropy; a cluttered frame spread across many classes has high
+entropy. Entropy is computed over *pixel proportion per class*, not
+instance count — ten small signage instances contribute the same
+$p_c$ as one large one, since the metric measures visual "busyness,"
+not object count.
 
-Object-node position/area come from each detected instance's own pixel
-mask; its categorical class field records which specific source class
-produced that instance.
+Object-node position/area come from each instance's own pixel mask;
+its categorical class field records which source class produced it.
 
-**What each node type consists of, directly from the segmentation
-output above:**
+**Per-node-type composition, from the segmentation output above:**
 
-- **viewpoint**: consists of sky-view factor, spatial enclosure, visual
-  entropy, and the fixed image-frame position $(x,y)$ — $5$ dimensions,
+- **viewpoint** (`EGO`): consists of sky-view factor (`SVF`), spatial
+  enclosure (`ENCL`), visual entropy (`ENTR`), and the fixed
+  image-frame position $(x,y)$ (`POS_X`, `POS_Y`) — $5$ dimensions,
   exactly one node per graph, computed from the whole segmentation map
   rather than from any single detected instance.
-- **signage**: one node per surviving `signage`-mapped instance
+- **signage** (`SGN`): one node per surviving `signage`-mapped instance
   (Traffic Sign Frame, Traffic Sign Front, Traffic Sign Back, Banner,
-  or Billboard); consists of that instance's normalized position $(2)$,
-  normalized mask area $(1)$, and a categorical class embedding
-  ($d_{cls}=4$) recording which of those five source classes it was —
-  $7$ dimensions total.
-- **light_pole**: one node per surviving `light_pole`-mapped instance
-  (Traffic Light, Street Light, Pole, or Utility Pole); consists of
-  position, area, and a class embedding over those four source
-  classes — $7$ dimensions total.
-- **road_marking**: one node per connected component of a fused
+  or Billboard); consists of that instance's normalized position $(2)$
+  (`POS_X`, `POS_Y`), normalized mask area $(1)$ (`AREA`), and a
+  categorical class embedding ($d_{cls}=4$, `CLS_EM`) recording which
+  of those five source classes it was — $7$ dimensions total.
+- **light_pole** (`PLE`): one node per surviving `light_pole`-mapped
+  instance (Traffic Light, Street Light, Pole, or Utility Pole);
+  consists of position (`POS_X`, `POS_Y`), area (`AREA`), and a class
+  embedding (`CLS_EM`) over those four source classes — $7$ dimensions
+  total.
+- **road_marking** (`MRK`): one node per connected component of a fused
   `road_marking`-mapped "stuff" mask (Crosswalk (plain) or Lane
-  marking (general)); consists of position, area, and a class
-  embedding over those two source classes — $7$ dimensions total.
-- **building**: one node per connected component of the fused
-  `Building` "stuff" mask; consists of normalized position $(2)$ and
-  normalized mask area $(1)$ only — $3$ dimensions total; no class
-  embedding, since this node type maps to only one source segmentation
-  class.
-- **vegetation**: one node per connected component of the fused
-  `Vegetation` "stuff" mask; consists of position and area only — $3$
-  dimensions total, same reasoning as `building`.
+  marking (general)); consists of position (`POS_X`, `POS_Y`), area
+  (`AREA`), and a class embedding (`CLS_EM`) over those two source
+  classes — $7$ dimensions total.
+- **building** (`BLD`; `BLD-S` only inside Scheme F's merged graph,
+  §7.5): one node per connected component of the fused `Building`
+  "stuff" mask; consists of normalized position $(2)$ (`POS_X`,
+  `POS_Y`) and normalized mask area $(1)$ (`AREA`) only — $3$
+  dimensions total; no class embedding, since this node type maps to
+  only one source segmentation class.
+- **vegetation** (`VEG`): one node per connected component of the fused
+  `Vegetation` "stuff" mask; consists of position (`POS_X`, `POS_Y`)
+  and area (`AREA`) only — $3$ dimensions total, same reasoning as
+  `building`.
 
 ```mermaid
 flowchart TB
@@ -352,11 +321,11 @@ the frame — a different metric, easily confused with SVF):
 
 **Node types and raw feature dimensionality.**
 
-| Node type | Raw feature vector | Raw dim |
-|---|---|---|
-| viewpoint (1 per graph) | sky-view factor, spatial enclosure, visual entropy, image-frame position $(x,y)$ | $5$ |
-| object type with $\geq 2$ subclasses (e.g. signage, poles, road markings) | normalized position $(2)$ + normalized mask area $(1)$ + categorical class embedding $(d_{cls})$ | $3 + d_{cls}$ |
-| object type with 1 subclass (e.g. buildings, vegetation, in this graph) | normalized position $(2)$ + normalized mask area $(1)$ | $3$ |
+| Node type | Code | Raw feature vector | Raw dim |
+|---|---|---|---|
+| viewpoint (1 per graph) | `EGO` | sky-view factor (`SVF`), spatial enclosure (`ENCL`), visual entropy (`ENTR`), image-frame position $(x,y)$ (`POS_X`, `POS_Y`) | $5$ |
+| object type with $\geq 2$ subclasses (e.g. signage `SGN`, poles `PLE`, road markings `MRK`) | `SGN`/`PLE`/`MRK` | normalized position $(2)$ (`POS_X`, `POS_Y`) + normalized mask area $(1)$ (`AREA`) + categorical class embedding $(d_{cls})$ (`CLS_EM`) | $3 + d_{cls}$ |
+| object type with 1 subclass (e.g. buildings `BLD`, vegetation `VEG`, in this graph) | `BLD`/`VEG` | normalized position $(2)$ (`POS_X`, `POS_Y`) + normalized mask area $(1)$ (`AREA`) | $3$ |
 
 The categorical class embedding dimension is $d_{cls} = 4$, and its
 vocabulary size is set per object type from the number of distinct
@@ -374,36 +343,32 @@ differs by relation, not a uniform scalar throughout:
 | *mounted-on* | `signage`$\leftrightarrow$`signage`, `light_pole`$\leftrightarrow$`light_pole`, `signage`$\leftrightarrow$`light_pole` **only** — never `road_marking`, `building`, or `vegetation` | bounding-box overlap ratio — $1$ (informative when present, but *not* the trigger) | centroid distance $\leq$ a small threshold (fraction of image diagonal); bounding-box overlap is **not** required |
 | *near* | every pairwise combination among **all 5** object types, including same-type pairs ($15$ type-pair combinations total) | normalized centroid distance — $1$ | centroid distance $\leq$ a looser threshold than *mounted-on*'s |
 
-Every relation is stored **bidirectionally** — both directions of each
-qualifying pair are added as explicit edges, not left for the model to
-infer via symmetry. Distance for *mounted-on* and *near* is the
-Euclidean distance between object centroids divided by the image
-diagonal (aspect-ratio-safe, unlike a naive per-axis normalization);
-*sees*'s distance is measured the same way, from each object's
-centroid to the fixed viewpoint position.
+Every relation is stored **bidirectionally**. Distance for
+*mounted-on* and *near* is Euclidean distance between object centroids
+divided by the image diagonal (aspect-ratio-safe); *sees*'s distance
+is measured the same way, from each object's centroid to the
+viewpoint.
 
-*mounted-on* is deliberately narrower in scope than *near* and uses a
-much smaller distance threshold, so the two relations capture
-materially different things rather than one being a subset of the
-other by accident: *mounted-on* targets "physically co-located on the
-same support" (e.g. a sign and a light mounted on the same pole),
-while *near* already covers general spatial proximity, at a looser
-threshold, across every object type — including the three types
-(`road_marking`, `building`, `vegetation`) that *mounted-on* never
-touches at all.
+*mounted-on* is narrower in scope than *near* and uses a much smaller
+threshold, so the two capture materially different things:
+*mounted-on* targets physical co-location on the same support (e.g. a
+sign and light on one pole), while *near* covers general spatial
+proximity, at a looser threshold, across all object types — including
+`road_marking`, `building`, and `vegetation`, which *mounted-on* never
+touches.
 
 ### 2.4 Allocentric Graph: OpenStreetMap Acquisition to Graph Generation
 
 #### 2.4.1 Acquisition
 
-Building footprints (tag `building=*`) and the street network are
-fetched via the Overpass API and reprojected to a local metric (UTM)
-coordinate system; building type is OSM's own tag value, pooled across
-the whole dataset into one shared vocabulary with rare/noisy values
-collapsed into an "other" bucket (kept distinct from untagged
-"unknown"). Intersection features (betweenness centrality, orientation
-entropy) are computed once over the full street-network graph. Road
-type is OSM's `highway=*` tag of the nearest street segment.
+Building footprints (`building=*`) and the street network are fetched
+via the Overpass API and reprojected to a local metric (UTM) CRS.
+Building type is OSM's own tag value, pooled dataset-wide into one
+vocabulary with rare/noisy values collapsed into an "other" bucket
+(kept distinct from untagged "unknown"). Intersection features
+(betweenness centrality, orientation entropy) are computed once over
+the full street-network graph. Road type is the `highway=*` tag of the
+nearest street segment.
 
 **The six building geometric descriptors, with their equations.** All
 six are computed directly from each footprint polygon $P$; the last
@@ -431,52 +396,49 @@ $$
 \text{Shape Index} = \frac{\text{Area}(P)}{\text{Area}(R)}
 $$
 
-**Area** and **Perimeter** are the footprint's own size; **Compactness**
-is a circularity ratio ($1.0$ for a perfect circle, decreasing toward
-$0$ as the shape becomes more elongated or irregular — the *same*
-formula reused below for the isovist polygon); **Elongation** is how
-stretched the footprint's bounding rectangle is (near $1$ for a square
-footprint, near $0$ for a long thin one); **Orientation** is that
+**Compactness** is a circularity ratio ($1.0$ for a perfect circle,
+decreasing toward $0$ with elongation/irregularity — reused below for
+the isovist polygon). **Elongation** is bounding-rectangle stretch
+(near $1$ for square, near $0$ for thin). **Orientation** is the
 rectangle's compass angle, folded into $[0°,180°)$ since a building's
-long axis has no meaningful "front" direction; **Shape Index** is how
-much of its own bounding rectangle the footprint actually fills (near
-$1$ for a simple rectangular footprint, lower for an irregular or
-L-shaped one).
+long axis has no meaningful "front." **Shape Index** is how much of
+its bounding rectangle the footprint fills (near $1$ for rectangular,
+lower for irregular/L-shaped).
 
-**Occlusivity** — defined only for the isovist polygon (below), as the
-fraction of the $n$ cast rays that were *triggered* (stopped by a
-building) rather than reaching the full search radius unobstructed:
+**Occlusivity** — defined for the isovist polygon only, as the
+fraction of $n$ cast rays *triggered* (stopped by a building) rather
+than reaching the full search radius:
 
 $$
 \text{Occlusivity} = \frac{1}{n} \sum_{k=1}^{n} \mathbb{1}\big[\text{ray}_k \text{ triggered by a building}\big]
 $$
 
-where $\mathbb{1}[\cdot]$ is the indicator function ($1$ if that ray
-was triggered, $0$ if it reached the radius unobstructed) — a direct
-proxy for how visually enclosed the location is: $\text{Occlusivity}
-\to 1$ means nearly every direction is blocked nearby, $\text{Occlusivity}
-\to 0$ means the point sits in open, unobstructed space. The isovist
-polygon's own **Area** and **Compactness** reuse the same two
-equations above, applied to the ray-cast polygon instead of a building
-footprint.
+with $\mathbb{1}[\cdot]$ the indicator function — a direct proxy for
+visual enclosure: $\text{Occlusivity}\to 1$ means nearly every
+direction is blocked nearby, $\to 0$ means open, unobstructed space.
+The isovist polygon's own **Area** and **Compactness** reuse the same
+two equations above, applied to the ray-cast polygon.
 
-**What each node type consists of:**
+**Per-node-type composition:**
 
-- **focal**: consists of segment position $(1)$, isovist area $(1)$,
-  isovist compactness $(1)$, isovist occlusivity $(1)$, and a
-  road-type embedding ($d_{hw}=8$) — $4+d_{hw}=12$ dimensions total;
-  exactly one node per graph.
-- **building**: one node per OSM building footprint within range;
-  consists of the six geometric descriptors above, a building-type
-  embedding ($d_{bt}=32$), and two missing-aware continuous
-  projections (height, storey count — each $d_{miss}=4$, §2.5) —
+- **focal** (`INC`): consists of segment position $(1)$ (`FR_AL`),
+  isovist area $(1)$ (`ISO_AR`), isovist compactness $(1)$ (`ISO_CP`),
+  isovist occlusivity $(1)$ (`ISO_OC`), and a road-type embedding
+  ($d_{hw}=8$, `HWY_EM`) — $4+d_{hw}=12$ dimensions total; exactly one
+  node per graph.
+- **building** (`BLD`; `BLD-T` only inside Scheme F's merged graph,
+  §7.5): one node per OSM building footprint within range; consists of
+  the six geometric descriptors above (`FP_AR`, `PERIM`, `CIRC`,
+  `ELONG`, `ORIENT`, `SHP_IX`), a building-type embedding ($d_{bt}=32$,
+  `BTY_EM`), and two missing-aware continuous projections (height
+  `HGT`, storey count `LVLS` — each $d_{miss}=4$, §2.5) —
   $6+d_{bt}+2d_{miss}=46$ dimensions total.
-- **intersection**: one node per street-network junction within range;
-  consists of betweenness centrality and orientation entropy only —
-  $2$ dimensions total.
-- **peer** (ablation-only): one node per nearby prior incident;
-  consists of a single constant placeholder — $1$ dimension, no
-  independently-measured attributes at all.
+- **intersection** (`INT`): one node per street-network junction within
+  range; consists of betweenness centrality (`BTW`) and orientation
+  entropy (`OR_EN`) only — $2$ dimensions total.
+- **peer_incident** (`PER`, ablation-only): one node per nearby prior
+  incident; consists of a single constant placeholder — $1$ dimension,
+  no independently-measured attributes at all.
 
 ```mermaid
 flowchart TB
@@ -498,26 +460,19 @@ flowchart TB
     O11 --> O14
 ```
 
-**Illustration — isovist construction and its ray/building
-"triggering" logic.** From the focal point, $n$ rays are cast at evenly
-spaced angles across the full $360°$. Testing every ray against every
-building footprint in the study area individually would be far too
-slow at this scale (potentially thousands of rays, across many
-candidate points, each against every nearby building); instead, an
-**STRtree** — an R-tree-based spatial index, built once over every
-building boundary — lets each ray query the index directly for only
-the small set of candidate buildings whose bounding box could possibly
-intersect it, rather than checking every building in the study area
-one by one. Exact ray-polygon intersection is then computed only
-against that short candidate list, and if any intersection exists, the
-ray is **triggered** (stopped) at the *closest* such intersection
-point — not the first candidate the index happens to return, but
-whichever intersection point is nearest the focal point. A ray whose
-candidate list yields no intersection at all is left un-triggered and
-extends to the full search radius. The isovist polygon is then the
-polygon connecting every ray's endpoint, in angular order — its three
-summary features (area, compactness, occlusivity) are all computed
-from this one polygon plus the per-ray triggered/un-triggered flags:
+**Illustration — isovist construction and ray/building "triggering"
+logic.** From the focal point, $n$ rays are cast at evenly spaced
+angles across $360°$. Rather than testing every ray against every
+building footprint individually, an **STRtree** — an R-tree spatial
+index built once over every building boundary — lets each ray query
+only the small set of candidate buildings whose bounding box could
+intersect it. Exact ray-polygon intersection is then computed against
+that short candidate list; if any intersection exists, the ray is
+**triggered** (stopped) at the *closest* such point. A ray with no
+intersection is left un-triggered and extends to the full search
+radius. The isovist polygon connects every ray's endpoint in angular
+order; its three summary features (area, compactness, occlusivity)
+are computed from this polygon plus the per-ray triggered flags:
 
 <p align="center">
 <svg viewBox="0 0 480 480" width="440" height="440" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
@@ -564,12 +519,12 @@ directly from this one construction.
 
 **Node types and raw feature dimensionality.**
 
-| Node type | Raw feature vector | Raw dim |
-|---|---|---|
-| focal (1 per graph) | segment position $(1)$, isovist area $(1)$, isovist compactness $(1)$, isovist occlusivity $(1)$, road-type embedding $(d_{hw})$ | $4 + d_{hw}$ |
-| building | footprint area, perimeter, compactness, elongation, orientation, shape index $(6)$, building-type embedding $(d_{bt})$, height projection $(d_{miss})$, storey-count projection $(d_{miss})$ | $6 + d_{bt} + 2 d_{miss}$ |
-| intersection | betweenness centrality, orientation entropy | $2$ |
-| peer (ablation-only) | constant placeholder (no independent attributes) | $1$ |
+| Node type | Code | Raw feature vector | Raw dim |
+|---|---|---|---|
+| focal (1 per graph) | `INC` | segment position $(1)$ (`FR_AL`), isovist area $(1)$ (`ISO_AR`), isovist compactness $(1)$ (`ISO_CP`), isovist occlusivity $(1)$ (`ISO_OC`), road-type embedding $(d_{hw})$ (`HWY_EM`) | $4 + d_{hw}$ |
+| building | `BLD` | footprint area (`FP_AR`), perimeter (`PERIM`), compactness (`CIRC`), elongation (`ELONG`), orientation (`ORIENT`), shape index (`SHP_IX`) $(6)$, building-type embedding $(d_{bt})$ (`BTY_EM`), height projection $(d_{miss})$ (`HGT`), storey-count projection $(d_{miss})$ (`LVLS`) | $6 + d_{bt} + 2 d_{miss}$ |
+| intersection | `INT` | betweenness centrality (`BTW`), orientation entropy (`OR_EN`) | $2$ |
+| peer_incident (ablation-only) | `PER` | constant placeholder (no independent attributes) | $1$ |
 
 with $d_{hw} = 8$ (road-type embedding), $d_{bt} = 32$ (building-type
 embedding — sized against a pooled, multi-source vocabulary of **229**
@@ -901,12 +856,11 @@ G^{unified} = \text{Merge}(G^{ego}, G^{allo}), \qquad
 z = z^{unified} \in \mathbb{R}^{256}, \qquad \text{logit} = \text{Head}(z^{unified})
 $$
 
-A single shared encoder ($d_h{=}128$, $H{=}4$ heads, $L{=}2$ layers,
-same as every other scheme) processes the merged graph — now $10$
-node types and $\sim 12$ edge relations total — in one pass, so
-cross-graph information can mix as early as the first message-passing
-layer, not just at the readout or classifier stage. Classifier input
-width $d_{in} = 256$.
+A single shared encoder ($d_h{=}128$, $H{=}4$ heads, $L{=}2$ layers)
+processes the merged graph — $10$ node types, $\sim 12$ edge
+relations — in one pass, so cross-graph information mixes as early as
+the first message-passing layer. Classifier input width
+$d_{in} = 256$.
 
 ```mermaid
 flowchart LR
@@ -925,11 +879,11 @@ flowchart LR
 is what drives any predictive advantage over the same raw content
 presented as a conventional flat feature vector.*
 
-The only scheme that discards graph structure entirely: every node's
-raw features across both graphs are flattened into one fixed-length
-row per location (counts, means, and summary statistics per node
-type), and a gradient-boosted decision tree ensemble replaces the
-entire encoder/readout/head stack:
+The only scheme that discards graph structure: every node's raw
+features across both graphs are flattened into one fixed-length row
+per location (counts, means, and summary statistics per node type),
+and a gradient-boosted decision tree ensemble replaces the entire
+encoder/readout/head stack:
 
 $$
 \phi_i = \text{Flatten}(G^{ego}_i, G^{allo}_i) \in \mathbb{R}^{d_{tab}}, \qquad
@@ -941,11 +895,6 @@ $$
 | Ensemble size | $200$ trees |
 | Maximum tree depth | $4$ |
 | Split objective | PR-AUC-oriented boosting objective |
-
-This scheme exists to test whether graph **structure** (which relation
-connects which entity to which) contributes predictive value beyond
-what the same raw information provides when presented as an
-unstructured feature vector.
 
 ```mermaid
 flowchart LR
@@ -971,42 +920,31 @@ flowchart LR
 
 ## 5. Training Procedure
 
-Every scheme (§4) is trained under an identical procedure, so that any
-difference in final performance between schemes is attributable to the
-fusion mechanism itself rather than to a difference in how each was
-trained. For each scheme, the pooled dataset is split randomly into
-train, validation, and test partitions at a $75\%/15\%/10\%$ ratio,
-stratified on the binary label only — not on city, road type, or any
-other attribute — and this split-train-evaluate cycle is repeated $5$
-independent times with a fresh random split each time, so that reported
-performance reflects a distribution across re-splits rather than a
-single lucky (or unlucky) partition.
+Every scheme (§4) is trained under an identical procedure, so any
+performance difference is attributable to the fusion mechanism rather
+than to training differences. The pooled dataset is split randomly
+into train/validation/test partitions at $75\%/15\%/10\%$, stratified
+on the binary label only, and this split-train-evaluate cycle is
+repeated $5$ independent times with a fresh random split each time, so
+reported performance reflects a distribution across re-splits rather
+than a single partition.
 
 Within each repeat, the model is optimized with AdamW (learning rate
-$1\times10^{-3}$, weight decay $1\times10^{-3}$), with the learning
-rate reduced on a validation-metric plateau (patience $3$ evaluation
-rounds). Training runs for a fixed budget of $100$ epochs with **no**
-warm-up period and, deliberately, **no early stopping**: the patience
-parameter is set greater than or equal to the epoch budget by
-construction, so every repeat trains the full $100$ epochs regardless
-of validation performance along the way, rather than stopping early at
-a variable point. This is a deliberate choice to isolate
-capacity/architecture effects from stopping-time variance — a scheme
-that converges faster is not given a training-time advantage over one
-that converges slower, since both simply run to the same fixed budget.
-Loss is computed in mixed precision (bfloat16) throughout, and the
-decision threshold applied to the model's output probability is held
-fixed at $0.5$ for every scheme, so threshold-tuning is never a
-confound in the fusion-mechanism comparison either.
+$1\times10^{-3}$, weight decay $1\times10^{-3}$), with learning rate
+reduced on a validation-metric plateau (patience $3$ evaluation
+rounds), for a fixed budget of $100$ epochs with no warm-up and no
+early stopping (patience $\geq$ epoch budget by construction) — a
+deliberate choice isolating capacity/architecture effects from
+stopping-time variance, since a faster-converging scheme gains no
+training-time advantage. Loss is computed in mixed precision
+(bfloat16); the decision threshold is fixed at $0.5$ for every scheme,
+so threshold-tuning is never a confound in the fusion comparison.
 
-Model selection happens at two nested levels. Within a repeat, the
-single epoch whose validation accuracy is highest is the one whose
-weights are kept — validation accuracy is the primary model-selection
-metric throughout this study, not a proxy metric like PR-AUC or loss.
-Across the $5$ repeats for a given scheme, only the single
-best-performing repeat's weights are retained as that scheme's final
-model; this is the specific checkpoint that the explanation stage (§7)
-later analyzes, not an ensemble or average across repeats.
+Model selection is nested: within a repeat, the epoch with highest
+validation accuracy (the primary selection metric throughout) is kept;
+across the $5$ repeats, only the best-performing repeat's weights are
+retained as the scheme's final model — the checkpoint the explanation
+stage (§7) later analyzes, not an ensemble or average.
 
 | Parameter | Value |
 |---|---|
@@ -1023,18 +961,16 @@ later analyzes, not an ensemble or average across repeats.
 | Mixed precision | enabled (bfloat16) |
 | Repeats per scheme | $5$ |
 
-**Compute environment.** All training was carried out on Google Colab,
-using the **High-RAM** runtime option paired with an **NVIDIA A100**
-GPU — chosen specifically for this pipeline's memory footprint (the
-heterogeneous, multi-relation graph batches and the pooled multi-city
-dataset held in memory during training) and to keep the fixed $100$
-epoch $\times$ $5$ repeat $\times$ seven-scheme training budget within a
+**Compute environment.** Training was carried out on Google Colab,
+using the **High-RAM** runtime paired with an **NVIDIA A100** GPU —
+chosen for the pipeline's memory footprint (heterogeneous multi-relation
+graph batches, pooled multi-city dataset held in memory) and to keep
+the $100$ epoch $\times$ $5$ repeat $\times$ seven-scheme budget within
 practical wall-clock time.
 
-**Software and key libraries.** Listed below are the libraries specific
-to this pipeline's less-common stages — general-purpose data-science
-packages (array/dataframe handling, standard ML metrics, plotting) are
-omitted as implementation detail, not because they're unused:
+**Software and key libraries.** Libraries specific to this pipeline's
+less-common stages (general-purpose data-science packages are omitted
+as implementation detail):
 
 | Pipeline stage | Key library / package |
 |---|---|
@@ -1119,60 +1055,50 @@ $$
 | Edge sparsity coefficient $\lambda_{edge}$ | $0.005$ |
 | Entropy coefficient $\lambda_H$ | $0.1$ |
 
-where the fidelity term pushes the masked prediction to match the
-model's *own* original prediction (not the ground-truth label), the
+where the fidelity term pushes the masked prediction toward the
+model's own original prediction (not the ground-truth label), the
 $\ell_1$-style sparsity terms encourage sparse masks, and $\mathcal{H}$
-is an entropy penalty pushing every mask value toward a confident $0$
-or $1$ rather than an ambiguous $0.5$. This objective is solved the
-same way the model itself was trained — iterative gradient descent —
-because it has no closed-form solution: the fidelity term depends on
-the mask through the entire nonlinear forward pass.
+pushes every mask value toward a confident $0$ or $1$. This objective
+has no closed-form solution — the fidelity term depends on the mask
+through the entire nonlinear forward pass — so it is solved by
+iterative gradient descent, the same way the model itself was trained.
 
 For **dual-graph schemes (C, D, E)**, each branch is explained
-separately, holding the other branch's (unmasked) input fixed, so that
-"how important was this node to the *egocentric* branch's
-contribution" is never conflated with the allocentric branch's
-contribution.
+separately, holding the other branch's (unmasked) input fixed, so
+egocentric- and allocentric-branch importance are never conflated.
 
 **Optional finer granularity**: rather than one mask value per node,
-the same mechanism can instead learn one mask value per **named input
-feature component** (e.g. distinguishing a building's footprint area
-from its height, rather than only "this building node"), by applying
-$M$ to the raw, pre-projection feature vector at the granularity of its
-named constituent fields — every continuous field individually
-($1$ mask value each), every categorical field's whole embedding block
-as one shared unit ($1$ mask value covering all $4$–$32$ embedding
-dimensions, since sub-embedding-dimension masking is not independently
-interpretable). Same optimizer/learning-rate/epoch/coefficient values
-as the node-level case above.
+the same mechanism can learn one mask value per **named input feature
+component** (e.g. a building's footprint area vs. its height), by
+applying $M$ to the raw, pre-projection feature vector at the
+granularity of its named constituent fields — every continuous field
+individually, every categorical field's whole embedding block as one
+shared unit (sub-embedding-dimension masking is not independently
+interpretable). Same optimizer/learning-rate/epoch/coefficients as the
+node-level case above.
 
 ### 7.3 Sampling and Aggregation Strategy
 
-Because the mask-learning step is a per-point optimization, it is run
-over a **sample** of points per scheme rather than the full test set —
-covering all four prediction-outcome categories (true positive, true
-negative, false positive, false negative) rather than correct
-predictions alone, since explaining *errors* is what reveals whether a
-model's mistakes stem from attending to the wrong evidence versus a
-genuine calibration issue. Sample size per category is a free
-parameter, chosen to balance statistical stability of the resulting
-per-type averages against the linear compute cost of the optimization
-above (each sampled point costs $100$ Adam steps through the frozen
+Because mask-learning is a per-point optimization, it runs over a
+**sample** of points per scheme rather than the full test set —
+covering all four prediction-outcome categories (TP, TN, FP, FN)
+rather than correct predictions alone, since explaining *errors*
+reveals whether mistakes stem from wrong evidence or a calibration
+issue. Sample size per category is a free parameter, balancing
+statistical stability against the linear compute cost of the
+optimization (each point costs $100$ Adam steps through the frozen
 model).
 
-Point-level results are then aggregated into scheme-level summaries —
-mean importance per node/edge type (or, at the finer granularity, per
-named feature component) across all sampled points for that scheme —
-enabling direct, scheme-to-scheme comparisons ("does scheme C rely on
-building density more than scheme B does") rather than only isolated,
-single-point case studies.
+Point-level results are aggregated into scheme-level summaries — mean
+importance per node/edge type (or, at finer granularity, per named
+feature component) across sampled points — enabling direct
+scheme-to-scheme comparisons rather than isolated case studies.
 
 ### 7.4 Choosing Explanation Depth: Two Options
 
-§7.2's node/edge-level mask and its "optional finer granularity"
-extension are not required to run together — they represent two
-genuinely separate options, differing in what question they can answer
-and what they cost:
+§7.2's node/edge-level mask and its finer-granularity extension are
+not required to run together — they are two separate options,
+differing in what question they answer and what they cost:
 
 | | **Option 1 — node/edge-level** | **Option 2 — adds feature-level** |
 |---|---|---|
@@ -1182,14 +1108,75 @@ and what they cost:
 | Answers | "which node/edge did the model rely on" | Option 1's question, **plus** "which specific attribute of that node did it rely on" |
 | Use when | a scheme-to-scheme or type-to-type comparison is the goal | a claim needs to be made at the level of one specific measured attribute, not just "this node type mattered" |
 
-Both options explain the **same** trained model and the **same**
-sampled points — Option 2 does not replace Option 1's output, it adds
-a second, finer-grained report alongside it (§7.2's "optional finer
-granularity" paragraph gives the exact masking mechanism). Choosing
-Option 2 is a deliberate cost/granularity tradeoff, not a strictly
-better default: run Option 1 alone when the reporting question stays
-at the node/edge-type level, and add Option 2 specifically when a
-finer, attribute-level claim is needed.
+Both options explain the same trained model and sampled points —
+Option 2 adds a second, finer-grained report alongside Option 1's,
+rather than replacing it (§7.2 gives the exact masking mechanism).
+This is a deliberate cost/granularity tradeoff: Option 1 suffices for
+scheme- or type-level comparisons; Option 2 is added when a claim
+needs to be made at the level of one specific attribute.
+
+### 7.5 Abbreviation Key for Importance Reports and Figures
+
+A scheme-level importance report (§7.3) tabulates every node type —
+and, under Option 2 (§7.4), every named feature component within each
+node type — across every scheme, so figures and summary tables use
+short codes rather than full names as axis/legend labels. This key
+maps each code back to the node type or feature component it denotes,
+as introduced in §2.3–2.4.
+
+**Node-type codes.**
+
+| Code | Node type | Graph | Notes |
+|---|---|---|---|
+| `EGO` | ego / viewpoint | Egocentric | one per graph |
+| `SGN` | signage | Egocentric | |
+| `PLE` | light_pole | Egocentric | |
+| `MRK` | road_marking | Egocentric | |
+| `VEG` | vegetation | Egocentric | |
+| `BLD` | building | Egocentric **or** Allocentric | ambiguous alone — see below |
+| `BLD-S` | building (egocentric façade) | Egocentric v| only distinguished from `BLD-T` inside Scheme F's merged graph (§4.6); the two standalone graphs both just use `BLD` |
+| `INC` | incident / focal | Allocentric | one per graph |
+| `INT` | intersection | Allocentric | |
+| `BLD-T` | building (allocentric footprint) | Allocentric | see `BLD-S` note |
+| `PER` | peer_incident | Allocentric | ablation-only |
+
+**Per-node feature composition, by code** (dimensions as in
+§2.3.2/§2.4.2; $d_{cls}=4$, $d_{hw}=8$, $d_{bt}=32$, $d_{miss}=4$):
+
+| Node code | Feature codes it contains | Raw dim |
+|---|---|---|
+| `EGO` | `SVF`, `ENCL`, `ENTR`, `POS_X`, `POS_Y` | $5$ |
+| `SGN` / `PLE` / `MRK` | `POS_X`, `POS_Y`, `AREA`, `CLS_EM` | $3+d_{cls}=7$ |
+| `VEG` / `BLD` (`BLD-S`) | `POS_X`, `POS_Y`, `AREA` | $3$ |
+| `INC` | `FR_AL`, `ISO_AR`, `ISO_CP`, `ISO_OC`, `HWY_EM` | $4+d_{hw}=12$ |
+| `INT` | `BTW`, `OR_EN` | $2$ |
+| `BLD` (`BLD-T`) | `FP_AR`, `PERIM`, `CIRC`, `ELONG`, `ORIENT`, `SHP_IX`, `BTY_EM`, `HGT`, `LVLS` | $6+d_{bt}+2d_{miss}=46$ |
+| `PER` | *(none — constant placeholder only)* | $1$ |
+
+**Feature codes.**
+
+| Code | Feature | Node code(s) it appears on |
+|---|---|---|
+| `SVF` | sky-view factor | `EGO` |
+| `ENCL` | enclosure index | `EGO` |
+| `ENTR` | visual entropy | `EGO` |
+| `POS_X`, `POS_Y` | normalized centroid position | `EGO`, `SGN`, `PLE`, `MRK`, `VEG`, `BLD-S` |
+| `AREA` | normalized **mask** area (egocentric object instance) | `SGN`, `PLE`, `MRK`, `VEG`, `BLD-S` |
+| `CLS_EM` | categorical class embedding | `SGN`, `PLE`, `MRK` |
+| `FR_AL` | fraction along the snapped road segment | `INC` |
+| `ISO_AR`, `ISO_CP`, `ISO_OC` | isovist area / compactness / occlusivity | `INC` |
+| `HWY_EM` | road-type (`highway=*`) embedding | `INC` |
+| `BTW`, `OR_EN` | betweenness centrality, orientation entropy | `INT` |
+| `FP_AR` | footprint **area** (allocentric building) | `BLD-T` |
+| `PERIM`, `CIRC`, `ELONG`, `ORIENT`, `SHP_IX` | perimeter, compactness, elongation, orientation, shape index | `BLD-T` |
+| `BTY_EM` | building-type embedding | `BLD-T` |
+| `HGT`, `LVLS` | height, storey-count (missing-aware projections) | `BLD-T` |
+
+`AREA` and `FP_AR` are **not interchangeable** despite both being "area":
+`AREA` is a segmentation-mask fraction of an egocentric object instance,
+`FP_AR` is an OSM footprint's physical area in the allocentric graph's
+metric CRS — a report or figure must disambiguate by which node code
+the value is attached to, never by the bare feature name alone.
 
 ---
 
